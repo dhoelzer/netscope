@@ -1,0 +1,36 @@
+[package]
+name = "netscope"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Live network packet visualiser: pcap capture rendered with Vello CPU"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["pcap", "vello", "network", "visualization"]
+categories = ["visualization", "network-programming"]
+
+[dependencies]
+# Packet capture against libpcap / Npcap.
+pcap = "2.5.0"
+# Vello's CPU renderer: no GPU, no wgpu, no driver requirements.
+vello_cpu = { version = "0.3.0", default-features = false, features = [
+    "std",
+    "text",
+    "u8_pipeline",
+    "multithreading",
+] }
+# Windowing + a software window surface, matching vello_cpu's own winit example.
+winit = "0.30.13"
+softbuffer = "0.4.8"
+# Portable interface/address enumeration (complements pcap::Device::addresses).
+if-addrs = "0.15.0"
+# Font metrics for laying out labels drawn through vello_cpu's glyph_run.
+skrifa = "0.44.0"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
