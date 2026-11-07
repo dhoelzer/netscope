@@ -4,13 +4,13 @@ pub mod layout;
 pub mod text;
 
 use vello_cpu::color::{AlphaColor, Srgb};
-use vello_cpu::kurbo::{Circle, Line, Point, Rect, Shape, Stroke};
+use vello_cpu::kurbo::{Cap, Circle, Line, Point, Rect, Shape, Stroke};
 use vello_cpu::{Pixmap, RenderContext, RenderSettings, Resources};
 
 use crate::capture::parse::Transport;
 use crate::model::{Model, RemoteHost};
 use crate::net::{AddressKind, LocalNetwork, format_address};
-use crate::render::layout::{LAN_LABEL_PITCH, Layout, describe_interface, lan_label};
+use crate::render::layout::{DETAIL_ROOM, LAN_LABEL_PITCH, Layout, describe_interface, lan_label};
 use crate::render::text::Font;
 use crate::service::Service;
 use std::collections::BTreeMap;
@@ -31,6 +31,9 @@ const REMOTE: Paint = rgb(0.98, 0.62, 0.25);
 const TEXT: Paint = rgb(0.90, 0.93, 0.98);
 const DIM: Paint = rgb(0.55, 0.60, 0.68);
 const WARN: Paint = rgb(0.98, 0.75, 0.30);
+/// Hop guide lines: present but recessive, they are a ruler, not data.
+const HOP_LINE: Paint = rgb(0.34, 0.40, 0.50);
+const HOP_LABEL: Paint = rgb(0.62, 0.68, 0.78);
 
 /// UI text sizes, scaled for readability at typical window sizes.
 const TITLE_SIZE: f32 = 16.0;
@@ -41,6 +44,17 @@ const HUD_SIZE: f32 = 14.5;
 const LEGEND_ROWS: usize = 8;
 /// Pixels between parallel lines that share a pair of endpoints.
 const LINK_FAN_GAP: f64 = 5.0;
+/// Dash on/off lengths for the hop guide lines, in pixels.
+const HOP_DASH_ON: f64 = 5.0;
+const HOP_DASH_OFF: f64 = 5.0;
+/// Floor for a remote address label; below this, truncation beats illegibility.
+const MIN_LABEL_SIZE: f32 = 8.5;
+/// Hop labels along the top, and the caption above them.
+const HOP_LABEL_SIZE: f32 = 11.5;
+/// Baseline for the hop labels, which sit at the very top of the display.
+const HOP_LABEL_BASELINE: f64 = 26.0;
+/// Baseline of the HUD title, which starts below the hop labels.
+const HUD_BASELINE: f64 = 50.0;
 
 /// Status line shown in the HUD.
 pub struct Hud<'a> {
@@ -108,12 +122,13 @@ impl Scene {
         let (w, h) = (f64::from(self.width), f64::from(self.height));
         let remotes: Vec<RemoteHost> = model.remotes().cloned().collect();
         let lan: Vec<_> = model.lan().cloned().collect();
-        let placed = crate::render::layout::build(w, h, network, &remotes, &lan);
+        let placed = crate::render::layout::build(w, h, network, &remotes, &lan, now);
 
         self.ctx.reset();
         self.ctx.set_paint(BG);
         self.ctx.fill_rect(&Rect::new(0.0, 0.0, w, h));
 
+        self.draw_hop_lines(&placed, h);
         self.draw_links(&placed, model, now);
         self.draw_host(&placed);
         self.draw_lan(&placed, network);
@@ -354,6 +369,76 @@ impl Scene {
 
     // ---- remote hosts ------------------------------------------------------
 
+    /// The hop ruler: 15 evenly spaced dashed vertical lines with a hop count
+    /// labelled at the top of each.
+    ///
+    /// `vello_cpu` accepts a dash pattern in its stroke but never reads it, so
+    /// the dashes are emitted as explicit segments.
+    fn draw_hop_lines(&mut self, placed: &Layout, height: f64) {
+        let Some(first) = placed.hop_lines.first() else {
+            return;
+        };
+        let top = HOP_LABEL_BASELINE;
+        let line_top = top + 8.0;
+
+        self.ctx.set_stroke(Stroke {
+            dash_pattern: vec![HOP_DASH_ON, HOP_DASH_OFF].into(),
+            start_cap: Cap::Butt,
+            end_cap: Cap::Butt,
+            ..Stroke::new(1.0)
+        });
+        self.ctx.set_paint(HOP_LINE);
+        for line in &placed.hop_lines {
+            self.ctx.stroke_path(&line_path(
+                Point {
+                    x: line.x,
+                    y: line_top,
+                },
+                Point {
+                    x: line.x,
+                    y: height,
+                },
+            ));
+        }
+
+        // Labels centred on their line.
+        self.ctx.set_paint(HOP_LABEL);
+        for line in &placed.hop_lines {
+            let text = line.hops.to_string();
+            let w = f64::from(self.font.measure(&text, HOP_LABEL_SIZE));
+            self.font.draw(
+                &mut self.ctx,
+                &mut self.resources,
+                Point {
+                    x: line.x - w / 2.0,
+                    y: top,
+                },
+                &text,
+                HOP_LABEL_SIZE,
+            );
+        }
+
+        // Caption naming the axis, in the margin left of the furthest line.
+        // The label row is otherwise full, so it stays short.
+        self.ctx.set_paint(DIM);
+        let caption = "hops";
+        let w = f64::from(self.font.measure(caption, HOP_LABEL_SIZE));
+        let furthest = placed.hop_lines.last().map(|l| l.x).unwrap_or(first.x);
+        let caption_x = furthest - w - 12.0;
+        if caption_x >= 8.0 {
+            self.font.draw(
+                &mut self.ctx,
+                &mut self.resources,
+                Point {
+                    x: caption_x,
+                    y: top,
+                },
+                caption,
+                HOP_LABEL_SIZE,
+            );
+        }
+    }
+
     fn draw_remotes(&mut self, placed: &Layout, now: std::time::Instant) {
         for remote in &placed.remotes {
             let opacity = Model::opacity(remote.host.last_seen, now);
@@ -370,41 +455,63 @@ impl Scene {
             self.ctx
                 .stroke_path(&Circle::new(center, remote.radius).to_path(0.1));
 
+            // Labels go under the circle: with 15 guide lines sharing the
+            // window there is no horizontal room beside it.
+            let size = self.remote_label_size(placed);
             let label = format_address(remote.host.addr);
-            let label = self
-                .font
-                .fit(&label, LABEL_SIZE, placed.label_budget as f32);
+            let label = self.font.fit(&label, size, placed.label_budget as f32);
+            let w = f64::from(self.font.measure(&label, size));
             self.ctx.set_paint(with_alpha(TEXT, opacity));
             self.font.draw(
                 &mut self.ctx,
                 &mut self.resources,
                 Point {
-                    x: center.x + remote.radius + 8.0,
-                    y: center.y + f64::from(self.font.ascent(LABEL_SIZE)) / 2.0,
+                    x: center.x - w / 2.0,
+                    y: center.y + remote.radius + f64::from(self.font.ascent(size)) + 3.0,
                 },
                 &label,
-                LABEL_SIZE,
+                size,
             );
 
-            let detail = format!(
-                "{} · {}",
-                transport_tag(remote.host.last_transport),
-                remote.host.packets
-            );
-            self.ctx.set_paint(with_alpha(DIM, opacity));
-            self.font.draw(
-                &mut self.ctx,
-                &mut self.resources,
-                Point {
-                    x: center.x + remote.radius + 8.0,
-                    y: center.y
-                        + f64::from(self.font.ascent(LABEL_SIZE)) / 2.0
-                        + f64::from(self.font.line_height(DETAIL_SIZE)),
-                },
-                &detail,
-                DETAIL_SIZE,
-            );
+            if placed.detail_budget >= DETAIL_ROOM {
+                let detail = format!(
+                    "{} · {} · {}",
+                    transport_tag(remote.host.last_transport),
+                    remote.host.packets,
+                    hop_tag(remote.host.hops),
+                );
+                let detail = self
+                    .font
+                    .fit(&detail, DETAIL_SIZE, placed.label_budget as f32);
+                let w = f64::from(self.font.measure(&detail, DETAIL_SIZE));
+                self.ctx.set_paint(with_alpha(DIM, opacity));
+                self.font.draw(
+                    &mut self.ctx,
+                    &mut self.resources,
+                    Point {
+                        x: center.x - w / 2.0,
+                        y: center.y
+                            + remote.radius
+                            + f64::from(self.font.ascent(size))
+                            + 3.0
+                            + f64::from(self.font.line_height(size)),
+                    },
+                    &detail,
+                    DETAIL_SIZE,
+                );
+            }
         }
+    }
+
+    /// Font size for a remote address, shrunk when the guide-line pitch is
+    /// narrow enough that a full IPv4 address would collide.
+    fn remote_label_size(&self, placed: &Layout) -> f32 {
+        let widest = f64::from(self.font.measure("255.255.255.255", LABEL_SIZE));
+        if widest <= placed.label_budget {
+            return LABEL_SIZE;
+        }
+        // Glyph width is proportional to size, so solve for the size that fits.
+        (LABEL_SIZE * (placed.label_budget / widest) as f32).max(MIN_LABEL_SIZE)
     }
 
     // ---- service legend ----------------------------------------------------
@@ -488,7 +595,7 @@ impl Scene {
         let size = HUD_SIZE;
         let line_h = f64::from(self.font.line_height(size));
         let x = 16.0f64;
-        let mut y = 16.0 + f64::from(self.font.ascent(size));
+        let mut y = HUD_BASELINE;
 
         self.ctx.set_paint(TEXT);
         self.font.draw(
@@ -501,6 +608,12 @@ impl Scene {
         y += line_h;
 
         self.ctx.set_paint(DIM);
+        // The status line must not run under the hop labels along the top.
+        let hud_width = placed
+            .hop_lines
+            .first()
+            .map(|l| (l.x - 24.0).max(240.0))
+            .unwrap_or(f64::from(self.width)) as f32;
         let quiet = if hud.quiet_for.is_finite() {
             format!("{:.1}s", hud.quiet_for)
         } else {
@@ -510,19 +623,23 @@ impl Scene {
             &mut self.ctx,
             &mut self.resources,
             Point { x, y },
-            &format!(
-                "frames {} · decoded {} · remote {} · lan {} · last packet {} · {:.0} fps{}",
-                hud.frames_seen,
-                hud.frames_decoded,
-                hud.remotes,
-                hud.lan_peers,
-                quiet,
-                hud.fps,
-                if placed.hidden > 0 {
-                    format!(" · {} not drawn", placed.hidden)
-                } else {
-                    String::new()
-                }
+            &self.font.fit(
+                &format!(
+                    "frames {} · decoded {} · remote {} · lan {} · last packet {} · {:.0} fps{}",
+                    hud.frames_seen,
+                    hud.frames_decoded,
+                    hud.remotes,
+                    hud.lan_peers,
+                    quiet,
+                    hud.fps,
+                    if placed.hidden > 0 {
+                        format!(" · {} not drawn", placed.hidden)
+                    } else {
+                        String::new()
+                    }
+                ),
+                size,
+                hud_width,
             ),
             size,
         );
@@ -599,6 +716,16 @@ fn interface_tint(kind: AddressKind) -> Paint {
         AddressKind::Loopback => rgb(0.30, 0.33, 0.40),
         AddressKind::LinkLocal => rgb(0.28, 0.40, 0.50),
         AddressKind::Global => rgb(0.26, 0.44, 0.42),
+    }
+}
+
+/// Distance readout for a remote host, before any inbound packet has revealed
+/// its TTL.
+fn hop_tag(hops: Option<u32>) -> String {
+    match hops {
+        Some(h) if h >= 32 => "32+ hops".to_string(),
+        Some(h) => format!("{h} hop{}", if h == 1 { "" } else { "s" }),
+        None => "hops ?".to_string(),
     }
 }
 

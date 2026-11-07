@@ -37,6 +37,15 @@ fn network() -> LocalNetwork {
 }
 
 fn remote(addr: &str, last_seen: Instant, packets: u64) -> netscope::model::RemoteHost {
+    remote_hops(addr, last_seen, packets, None)
+}
+
+fn remote_hops(
+    addr: &str,
+    last_seen: Instant,
+    packets: u64,
+    hops: Option<u32>,
+) -> netscope::model::RemoteHost {
     netscope::model::RemoteHost {
         addr: ip(addr),
         last_seen,
@@ -45,6 +54,8 @@ fn remote(addr: &str, last_seen: Instant, packets: u64) -> netscope::model::Remo
         bytes: packets * 60,
         lan_packets: 0,
         last_transport: Transport::Tcp,
+        hops,
+        hops_learned_at: None,
     }
 }
 
@@ -55,6 +66,11 @@ fn lan_peer(addr: &str, last_seen: Instant) -> LanHost {
         packets: 1,
         bytes: 60,
     }
+}
+
+/// Clock for layout tests: no test animates a slide, so any instant works.
+fn t0() -> Instant {
+    Instant::now()
 }
 
 fn empty_hud<'a>() -> Hud<'a> {
@@ -73,7 +89,7 @@ fn empty_hud<'a>() -> Hud<'a> {
 #[test]
 fn host_panel_is_a_tall_rectangle_in_the_upper_right() {
     let (w, h) = (1280.0, 800.0);
-    let placed = layout::build(w, h, &network(), &[], &[]);
+    let placed = layout::build(w, h, &network(), &[], &[], t0());
     let host = placed.host.as_ref().expect("host panel");
     let rect = host.rect;
 
@@ -88,7 +104,7 @@ fn host_panel_is_a_tall_rectangle_in_the_upper_right() {
 
 #[test]
 fn every_local_address_gets_a_square_inside_the_panel() {
-    let placed = layout::build(1280.0, 800.0, &network(), &[], &[]);
+    let placed = layout::build(1280.0, 800.0, &network(), &[], &[], t0());
     let host = placed.host.as_ref().unwrap();
 
     // Loopback included: one square per address assigned to the host.
@@ -127,7 +143,7 @@ fn every_local_address_gets_a_square_inside_the_panel() {
 #[test]
 fn lan_circle_sits_in_the_lower_right_below_the_host_panel() {
     let (w, h) = (1280.0, 800.0);
-    let placed = layout::build(w, h, &network(), &[], &[]);
+    let placed = layout::build(w, h, &network(), &[], &[], t0());
     let host = placed.host.as_ref().unwrap();
     let lan = placed.lan.as_ref().expect("lan circle");
 
@@ -158,7 +174,7 @@ fn lan_peers_get_their_own_circles_inside_the_lan_circle() {
         .iter()
         .map(|a| lan_peer(a, now))
         .collect();
-    let placed = layout::build(1280.0, 800.0, &network(), &[], &peers);
+    let placed = layout::build(1280.0, 800.0, &network(), &[], &peers, t0());
     let lan = placed.lan.as_ref().unwrap();
 
     assert_eq!(lan.hosts.len(), 3);
@@ -185,7 +201,7 @@ fn many_lan_peers_shrink_before_being_dropped() {
     let peers: Vec<_> = (0..40)
         .map(|i| lan_peer(&format!("192.168.1.{}", i + 2), now))
         .collect();
-    let placed = layout::build(1280.0, 800.0, &network(), &[], &peers);
+    let placed = layout::build(1280.0, 800.0, &network(), &[], &peers, t0());
     let lan = placed.lan.as_ref().unwrap();
 
     assert_eq!(lan.hosts.len() + lan.hidden, 40);
@@ -197,35 +213,69 @@ fn many_lan_peers_shrink_before_being_dropped() {
 }
 
 #[test]
-fn remote_hosts_are_placed_to_the_left_of_both_right_hand_shapes() {
+fn remote_circles_never_land_on_the_host_panel_or_lan_circle() {
     let now = Instant::now();
-    let remotes = vec![
-        remote("8.8.8.8", now, 3),
-        remote("1.1.1.1", now - std::time::Duration::from_secs(10), 1),
-    ];
-    let placed = layout::build(1280.0, 800.0, &network(), &remotes, &[]);
+    // Spread across every guide line, including the ones that run beside and
+    // through the right-hand shapes.
+    let remotes: Vec<_> = (1..=15)
+        .map(|h| remote_hops(&format!("203.0.113.{h}"), now, 1, Some(h)))
+        .collect();
+    let placed = layout::build(1280.0, 800.0, &network(), &remotes, &[], t0());
     let host = placed.host.as_ref().unwrap();
     let lan = placed.lan.as_ref().unwrap();
 
-    assert_eq!(placed.remotes.len(), 2);
+    assert_eq!(placed.remotes.len(), 15);
     for r in &placed.remotes {
+        let (x, y, rad) = (r.center.x, r.center.y, r.radius);
+        let clear_panel = x + rad < host.rect.x0
+            || x - rad > host.rect.x1
+            || y + rad < host.rect.y0
+            || y - rad > host.rect.y1;
         assert!(
-            r.center.x + r.radius < host.rect.x0,
-            "remotes left of the panel"
+            clear_panel,
+            "remote on {} hops overlaps the host panel at ({x:.0},{y:.0})",
+            r.host.hops.unwrap()
         );
+        let dist = ((x - lan.center.x).powi(2) + (y - lan.center.y).powi(2)).sqrt();
         assert!(
-            r.center.x + r.radius < lan.center.x + lan.radius,
-            "remotes left of the lan circle"
+            dist >= lan.radius - 0.01,
+            "remote on {} hops overlaps the lan circle at ({x:.0},{y:.0})",
+            r.host.hops.unwrap()
         );
+        assert!(y - rad >= 0.0 && y + rad <= 800.0, "stays on screen");
     }
-
-    // Newest first, so the busiest hosts sit at the top.
-    assert_eq!(placed.remotes[0].host.addr.to_string(), "8.8.8.8");
-    assert!(placed.remotes[0].center.y < placed.remotes[1].center.y);
 }
 
 #[test]
-fn many_remotes_wrap_into_columns_instead_of_being_dropped() {
+fn remotes_on_one_line_stack_newest_first() {
+    let now = Instant::now();
+    let remotes: Vec<_> = (0..3)
+        .map(|i| {
+            remote_hops(
+                &format!("203.0.113.{}", i + 1),
+                now - std::time::Duration::from_secs(i * 10),
+                1,
+                Some(6),
+            )
+        })
+        .collect();
+    let placed = layout::build(1280.0, 800.0, &network(), &remotes, &[], t0());
+
+    let line = layout::hop_line_positions(1280.0)[5];
+    let on_line: Vec<_> = placed
+        .remotes
+        .iter()
+        .filter(|r| (r.center.x - line).abs() < 0.01)
+        .collect();
+    assert_eq!(on_line.len(), 3, "all three share the 6-hop line");
+    assert_eq!(on_line[0].host.addr.to_string(), "203.0.113.1");
+    for pair in on_line.windows(2) {
+        assert!(pair[0].center.y < pair[1].center.y, "newest sits highest");
+    }
+}
+
+#[test]
+fn many_remotes_spread_over_lines_without_being_dropped() {
     let now = Instant::now();
     let remotes: Vec<_> = (0..40)
         .map(|i| {
@@ -237,15 +287,28 @@ fn many_remotes_wrap_into_columns_instead_of_being_dropped() {
         })
         .collect();
 
-    let placed = layout::build(1280.0, 800.0, &network(), &remotes, &[]);
+    let remotes: Vec<_> = remotes
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            remote_hops(
+                &r.addr.to_string(),
+                r.last_seen,
+                r.packets,
+                Some((i as u32 % 15) + 1),
+            )
+        })
+        .collect();
+    let placed = layout::build(1280.0, 800.0, &network(), &remotes, &[], t0());
     assert_eq!(placed.remotes.len(), 40, "every host should be drawn");
     assert_eq!(placed.hidden, 0);
     assert!(placed.slot <= layout::REMOTE_SLOT);
 
     let host = placed.host.as_ref().unwrap();
     let mut xs: Vec<f64> = placed.remotes.iter().map(|r| r.center.x).collect();
-    xs.dedup();
-    assert!(xs.len() > 1, "expected more than one column");
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    xs.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+    assert!(xs.len() > 1, "expected more than one guide line");
     for r in &placed.remotes {
         assert!(r.center.x + r.radius < host.rect.x0);
         assert!(r.center.y - r.radius >= 0.0);
@@ -259,7 +322,7 @@ fn a_tiny_window_reports_the_hosts_it_cannot_draw() {
     let remotes: Vec<_> = (0..60)
         .map(|i| remote(&format!("203.0.113.{}", i + 1), now, 1))
         .collect();
-    let placed = layout::build(420.0, 200.0, &network(), &remotes, &[]);
+    let placed = layout::build(420.0, 200.0, &network(), &remotes, &[], t0());
     assert_eq!(placed.remotes.len() + placed.hidden, 60);
     assert!(placed.hidden > 0, "a 420x200 window cannot fit 60 hosts");
     for r in &placed.remotes {
@@ -269,7 +332,7 @@ fn a_tiny_window_reports_the_hosts_it_cannot_draw() {
 
 #[test]
 fn link_anchors_land_on_the_right_shape() {
-    let placed = layout::build(1280.0, 800.0, &network(), &[], &[]);
+    let placed = layout::build(1280.0, 800.0, &network(), &[], &[], t0());
     let host = placed.host.as_ref().unwrap();
     let lan = placed.lan.as_ref().unwrap();
     let remote_center = Point { x: 120.0, y: 400.0 };
@@ -299,7 +362,7 @@ fn link_anchors_land_on_the_right_shape() {
 
 #[test]
 fn each_interface_links_to_its_own_square() {
-    let placed = layout::build(1280.0, 800.0, &network(), &[], &[]);
+    let placed = layout::build(1280.0, 800.0, &network(), &[], &[], t0());
     let host = placed.host.as_ref().unwrap();
     let target = Point { x: 120.0, y: 400.0 };
 
@@ -327,7 +390,7 @@ fn remote_columns_start_below_the_hud_text() {
     let remotes: Vec<_> = (0..6)
         .map(|i| remote(&format!("203.0.113.{}", i + 1), now, 1))
         .collect();
-    let placed = layout::build(1280.0, 800.0, &network(), &remotes, &[]);
+    let placed = layout::build(1280.0, 800.0, &network(), &remotes, &[], t0());
     for r in &placed.remotes {
         assert!(
             r.center.y - r.radius >= layout::HUD_RESERVE,
@@ -427,6 +490,7 @@ fn model_with_service(transport: Transport, port: Option<u16>, at: Instant) -> M
                 dst_port: port,
                 transport,
                 wire_len: 60,
+                ttl: 64,
             },
         },
         &network(),
@@ -506,6 +570,7 @@ fn a_further_packet_refreshes_the_line_to_full_brightness() {
                 dst_port: Some(443),
                 transport: Transport::Tcp,
                 wire_len: 60,
+                ttl: 64,
             },
         },
         &network(),
@@ -535,6 +600,7 @@ fn parallel_connections_to_one_host_are_all_visible() {
                     dst_port: Some(port),
                     transport: Transport::Tcp,
                     wire_len: 60,
+                    ttl: 64,
                 },
             },
             &network(),
@@ -605,6 +671,7 @@ fn rendering_a_full_scene_draws_panel_lan_and_remotes() {
             dst_port: None,
             transport: Transport::Tcp,
             wire_len: 60,
+            ttl: 64,
         };
         model.ingest(&Sample { frame }, &net, now);
     }
@@ -625,4 +692,267 @@ fn rendering_survives_a_resize_and_an_empty_model() {
     assert!(placed.host.is_some());
     assert!(placed.lan.is_some());
     assert_eq!(scene.pixmap().data().len(), 320 * 240);
+}
+
+// ---- hop guide lines ------------------------------------------------------
+
+/// True when a pixel is visibly different from the scene background.
+///
+/// Guide-line and circle colours go through vello's float-to-sRGB8 conversion,
+/// so the exact bytes are not worth restating here; what matters is that
+/// something was drawn where the layout says it should be.
+fn off_background(px: &(u8, u8, u8)) -> bool {
+    let bg = (12u8, 16, 24);
+    [px.0, px.1, px.2]
+        .iter()
+        .zip([bg.0, bg.1, bg.2])
+        .any(|(got, w)| (*got as i16 - w as i16).abs() > 12)
+}
+
+#[test]
+fn all_fifteen_guide_lines_are_drawn_where_the_layout_says() {
+    let now = Instant::now();
+    let mut scene = Scene::new(1280, 800);
+    scene.draw(&network(), &Model::default(), &empty_hud(), now);
+
+    let data = scene.pixmap().data();
+    let width = 1280usize;
+    let positions = layout::hop_line_positions(1280.0);
+    assert_eq!(positions.len(), 15);
+
+    for (i, x) in positions.iter().enumerate() {
+        let col = (*x as usize).clamp(1, width - 2);
+        // Count drawn pixels in a band above the LAN circle.
+        let lit = (100usize..380)
+            .filter(|y| {
+                off_background(&(
+                    data[y * width + col].r,
+                    data[y * width + col].g,
+                    data[y * width + col].b,
+                ))
+            })
+            .count();
+        assert!(
+            lit > 100,
+            "guide line {i} at x={x:.0} has only {lit} drawn pixels"
+        );
+
+        // Halfway to the next line must be empty, or we are measuring a band
+        // of background rather than a line.
+        if let Some(next) = positions.get(i + 1) {
+            let between = ((x + next) / 2.0) as usize;
+            let stray = (100usize..380)
+                .filter(|y| {
+                    off_background(&(
+                        data[y * width + between].r,
+                        data[y * width + between].g,
+                        data[y * width + between].b,
+                    ))
+                })
+                .count();
+            assert_eq!(stray, 0, "something drawn between lines {i} and {}", i + 1);
+        }
+    }
+}
+
+#[test]
+fn guide_lines_are_dashed_not_solid() {
+    let now = Instant::now();
+    let mut scene = Scene::new(1280, 800);
+    scene.draw(&network(), &Model::default(), &empty_hud(), now);
+
+    let data = scene.pixmap().data();
+    let width = 1280usize;
+    let x = layout::hop_line_positions(1280.0)[7] as usize;
+
+    let mut runs = 0;
+    let mut inside = false;
+    for y in 100usize..380 {
+        let px = &data[y * width + x];
+        let lit = off_background(&(px.r, px.g, px.b));
+        if lit && !inside {
+            runs += 1;
+        }
+        inside = lit;
+    }
+    // A solid line would give one run; 5-on/5-off over 280px gives far more.
+    assert!(runs > 15, "expected a dashed line, found {runs} run(s)");
+}
+
+#[test]
+fn a_remote_is_drawn_on_the_line_its_ttl_implied() {
+    let now = Instant::now();
+    let net = network();
+    let mut model = Model::default();
+    // TTL 58 arriving from 64 means 6 hops, so this host belongs on line 6.
+    let frame = Frame {
+        src: ip("203.0.113.40"),
+        dst: ip("192.168.1.20"),
+        src_port: None,
+        dst_port: None,
+        transport: Transport::Tcp,
+        wire_len: 60,
+        ttl: 58,
+    };
+    model.ingest(&Sample { frame }, &net, now);
+
+    let mut scene = Scene::new(1280, 800);
+    let placed = scene.draw(&net, &model, &empty_hud(), now);
+    assert_eq!(placed.remotes.len(), 1);
+    let remote = &placed.remotes[0];
+    assert_eq!(remote.host.hops, Some(6));
+    assert_eq!(remote.slot, Some(5));
+
+    let expected = layout::hop_line_positions(1280.0)[5];
+    assert!(
+        (remote.center.x - expected).abs() < 0.01,
+        "host should sit on the 6-hop line: {} vs {expected}",
+        remote.center.x
+    );
+
+    // And something is drawn at that spot: a horizontal scan crossing the
+    // circle must hit it.
+    let data = scene.pixmap().data();
+    let width = 1280usize;
+    let (cx, cy) = (remote.center.x as usize, remote.center.y as usize);
+    let drawn = (cx - 40..=cx)
+        .filter(|x| {
+            let px = &data[cy * width + x];
+            off_background(&(px.r, px.g, px.b))
+        })
+        .count();
+    assert!(drawn > 5, "nothing drawn on the 6-hop line at y={cy}");
+}
+
+#[test]
+fn a_host_with_no_ttl_reading_is_parked_at_the_left_edge() {
+    let now = Instant::now();
+    let net = network();
+    let mut model = Model::default();
+    // Outbound only: the TTL is ours, so it says nothing about distance.
+    let frame = Frame {
+        src: ip("192.168.1.20"),
+        dst: ip("203.0.113.41"),
+        src_port: None,
+        dst_port: None,
+        transport: Transport::Tcp,
+        wire_len: 60,
+        ttl: 64,
+    };
+    model.ingest(&Sample { frame }, &net, now);
+
+    let mut scene = Scene::new(1280, 800);
+    let placed = scene.draw(&net, &model, &empty_hud(), now);
+    let remote = &placed.remotes[0];
+    assert_eq!(remote.host.hops, None);
+    assert_eq!(remote.slot, None);
+    assert!(
+        (remote.center.x - placed.far_x).abs() < 0.01,
+        "unknown distance belongs at the left edge, got {}",
+        remote.center.x
+    );
+}
+
+#[test]
+fn a_distance_learned_later_slides_in_from_the_edge() {
+    let net = network();
+    let t0 = Instant::now();
+    let mut model = Model::default();
+    let outbound = Frame {
+        src: ip("192.168.1.20"),
+        dst: ip("203.0.113.42"),
+        src_port: None,
+        dst_port: None,
+        transport: Transport::Tcp,
+        wire_len: 60,
+        ttl: 64,
+    };
+    let inbound = Frame {
+        ttl: 60,
+        src: ip("203.0.113.42"),
+        dst: ip("192.168.1.20"),
+        ..outbound
+    };
+    model.ingest(&Sample { frame: outbound }, &net, t0);
+    model.ingest(&Sample { frame: inbound }, &net, t0);
+
+    // Immediately after the reply, the circle is still near the edge.
+    let placed = layout::build(
+        1280.0,
+        800.0,
+        &net,
+        &model.remotes().cloned().collect::<Vec<_>>(),
+        &[],
+        t0,
+    );
+    let early = &placed.remotes[0];
+    let line = layout::hop_line_positions(1280.0)[3];
+    assert_eq!(early.host.hops, Some(4));
+    assert!(
+        early.center.x < placed.far_x + (line - placed.far_x) * 0.2,
+        "should have barely left the edge, got {}",
+        early.center.x
+    );
+
+    // Once the slide has run, it is on its line.
+    let later = t0 + std::time::Duration::from_millis(1500);
+    let placed = layout::build(
+        1280.0,
+        800.0,
+        &net,
+        &model.remotes().cloned().collect::<Vec<_>>(),
+        &[],
+        later,
+    );
+    let settled = &placed.remotes[0];
+    assert!(
+        (settled.center.x - line).abs() < 0.01,
+        "should have settled on the line, got {}",
+        settled.center.x
+    );
+}
+
+#[test]
+fn hop_labels_stay_separate_at_every_window_width() {
+    // The numbers sit centred on their lines, so a narrow window squeezes them
+    // together; each must still occupy its own run of pixels.
+    for width in [1280usize, 900, 620] {
+        let mut scene = Scene::new(width as u16, 800);
+        scene.draw(&network(), &Model::default(), &empty_hud(), Instant::now());
+
+        let data = scene.pixmap().data();
+        let positions = layout::hop_line_positions(width as f64);
+        let mut clusters: Vec<(usize, usize)> = Vec::new();
+        for x in 0..width {
+            let drawn = (12usize..34).any(|y| {
+                let px = &data[y * width + x];
+                off_background(&(px.r, px.g, px.b))
+            });
+            if !drawn {
+                continue;
+            }
+            // Merge across the gap between digits; 5px is far below the
+            // narrowest pitch, so it cannot hide a real collision.
+            match clusters.last_mut() {
+                Some(last) if x - last.1 <= 5 => last.1 = x,
+                _ => clusters.push((x, x)),
+            }
+        }
+        // Every line must have a cluster centred on it, and that cluster must
+        // not spill into its neighbour's. The axis caption is extra, so the
+        // count is checked per line rather than in total.
+        let pitch = positions[0] - positions[1];
+        for (i, x) in positions.iter().enumerate() {
+            let centre = clusters
+                .iter()
+                .find(|(a, b)| *a <= *x as usize && *x as usize <= *b)
+                .unwrap_or_else(|| {
+                    panic!("no hop label centred on line {i} (x={x:.0}) at width {width}")
+                });
+            assert!(
+                (centre.1 - centre.0) as f64 <= pitch - 4.0,
+                "hop label {centre:?} too wide for a {pitch:.0}px pitch at width {width}"
+            );
+        }
+    }
 }

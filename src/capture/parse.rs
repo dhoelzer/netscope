@@ -52,6 +52,9 @@ pub struct Frame {
     pub transport: Transport,
     /// IP-level length reported by the wire, not the captured length.
     pub wire_len: u32,
+    /// IPv4 TTL / IPv6 hop limit as it arrived. Only an inbound packet's value
+    /// says anything about distance; ours is a value we chose.
+    pub ttl: u8,
 }
 
 /// Decodes one captured frame. Returns `None` for anything that is not IP.
@@ -127,6 +130,7 @@ fn decode_ipv4(bytes: &[u8]) -> Option<Frame> {
     }
     let total_len = u16::from_be_bytes([bytes[2], bytes[3]]) as u32;
     let protocol = bytes[9];
+    let ttl = bytes[8];
     let frag_off = u16::from_be_bytes([bytes[6], bytes[7]]);
     let src = IpAddr::V4(Ipv4Addr::from([bytes[12], bytes[13], bytes[14], bytes[15]]));
     let dst = IpAddr::V4(Ipv4Addr::from([bytes[16], bytes[17], bytes[18], bytes[19]]));
@@ -143,6 +147,7 @@ fn decode_ipv4(bytes: &[u8]) -> Option<Frame> {
         dst_port,
         transport,
         wire_len: total_len,
+        ttl,
     })
 }
 
@@ -151,6 +156,7 @@ fn decode_ipv6(bytes: &[u8]) -> Option<Frame> {
         return None;
     }
     let payload_len = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    let hop_limit = bytes[7];
     let src_octets: [u8; 16] = bytes[8..24].try_into().ok()?;
     let dst_octets: [u8; 16] = bytes[24..40].try_into().ok()?;
     let mut next = bytes[6];
@@ -178,6 +184,7 @@ fn decode_ipv6(bytes: &[u8]) -> Option<Frame> {
         dst_port,
         transport,
         wire_len: 40 + payload_len as u32,
+        ttl: hop_limit,
     })
 }
 

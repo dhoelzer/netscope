@@ -14,6 +14,9 @@ to get right:
   7. host -> remote over IPv6            (v6 addressing)
   8. ICMP echo to a remote               (a protocol with no ports at all)
   9. several services to one remote      (one circle, several coloured lines)
+ 10. inbound TTLs of 58, 251 and 60      (hop counts 6, 4 and 4)
+ 11. a remote seen only outbound         (no TTL reading: left edge)
+ 12. an inbound TTL implying 44 hops     (beyond the ceiling: left edge)
  10. a truncated frame                   (must be skipped, not panic)
 
 Run from the repository root:
@@ -33,7 +36,7 @@ def ethernet(src: str, dst: str, ethertype: int, body: bytes) -> bytes:
     return bytes.fromhex(src) + bytes.fromhex(dst) + struct.pack("!H", ethertype) + body
 
 
-def ipv4(src: str, dst: str, proto: int, payload: bytes) -> bytes:
+def ipv4(src: str, dst: str, proto: int, payload: bytes, ttl: int = 64) -> bytes:
     src_b = bytes(int(p) for p in src.split("."))
     dst_b = bytes(int(p) for p in dst.split("."))
     total = 20 + len(payload)
@@ -44,7 +47,7 @@ def ipv4(src: str, dst: str, proto: int, payload: bytes) -> bytes:
         total,
         0x1234,  # identification
         0x4000,  # flags = DF, fragment offset 0
-        64,  # TTL
+        ttl,  # arriving TTL: the decoder reads this to infer hop count
         proto,
         0,  # checksum (the decoder does not validate it)
     )
@@ -66,11 +69,11 @@ def udp(src_port: int, dst_port: int) -> bytes:
     return struct.pack("!HHHH", src_port, dst_port, 9, 0) + b"x"
 
 
-def ipv6(src: bytes, dst: bytes, next_header: int, payload: bytes) -> bytes:
+def ipv6(src: bytes, dst: bytes, next_header: int, payload: bytes, hop_limit: int = 64) -> bytes:
     return (
         struct.pack("!I", 0x60000000)
         + struct.pack("!H", len(payload))
-        + bytes([next_header, 64])
+        + bytes([next_header, hop_limit])
         + src
         + dst
         + payload
@@ -88,6 +91,8 @@ def build() -> bytes:
     remote_web = "93.184.216.34"
     remote_dns = "10.5.5.5"
     remote_ping = "203.0.113.9"
+    remote_edge = "198.51.100.7"
+    remote_far = "192.0.2.99"
     bridge = "10.20.0.5"
 
     host_mac, router_mac = "aabbccddeeff", "112233445566"
@@ -98,12 +103,23 @@ def build() -> bytes:
         # lines leaving one circle.
         ethernet(host_mac, router_mac, 0x0800, ipv4(host, remote_web, 6, tcp(51002, 80))),
         ethernet(host_mac, router_mac, 0x0800, ipv4(host, remote_ping, 1, icmp(8))),
-        ethernet(router_mac, host_mac, 0x0800, ipv4(remote_ping, host, 1, icmp(0))),
+        ethernet(router_mac, host_mac, 0x0800, ipv4(remote_ping, host, 1, icmp(0), ttl=60)),
+        # Seen only outbound: no inbound TTL, so this one stays at the left edge.
+        ethernet(host_mac, router_mac, 0x0800, ipv4(host, remote_edge, 6, tcp(51010, 443))),
+        # 20 arriving from 64 implies 44 hops, past the 32-hop ceiling, so this
+        # one is also parked at the left edge rather than guessed at.
+        ethernet(
+            router_mac, host_mac, 0x0800, ipv4(remote_far, host, 17, udp(40000, 40000), ttl=20)
+        ),
         # Second interface talking to a remote, so the demo shows links leaving
         # different squares of the host panel.
         ethernet(host_mac, router_mac, 0x0800, ipv4(bridge, remote_dns, 17, udp(5353, 53))),
-        ethernet(router_mac, host_mac, 0x0800, ipv4(remote_web, host, 6, tcp(443, 51000))),
-        ethernet(router_mac, host_mac, 0x0800, ipv4(remote_dns, lan_peer_a, 17, udp(53, 5353))),
+        # Inbound TTLs place each remote on a guide line: 58 from 64 is 6 hops,
+        # 251 from 255 is 4 hops, 60 from 64 is 4 hops.
+        ethernet(router_mac, host_mac, 0x0800, ipv4(remote_web, host, 6, tcp(443, 51000), ttl=58)),
+        ethernet(
+            router_mac, host_mac, 0x0800, ipv4(remote_dns, lan_peer_a, 17, udp(53, 5353), ttl=251)
+        ),
         ethernet(host_mac, router_mac, 0x0800, ipv4(lan_peer_a, lan_peer_b, 6, tcp(9000, 22))),
         ethernet(router_mac, host_mac, 0x0800, ipv4(lan_peer_a, host, 6, tcp(4514, 22))),
         ethernet(host_mac, "ffffffffffff", 0x0806, b"\x00" * 28),

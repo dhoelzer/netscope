@@ -54,7 +54,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fps: 0.0,
         notice: Some("static frame from savefile"),
     };
-    scene.draw(&network, &model, &hud, t0);
+    // Replay stamps every packet at t0, so drawing at t0 would freeze the
+    // slide-in at its start. Advance past it to show the settled view.
+    let settled = t0 + std::time::Duration::from_secs(2);
+    scene.draw(&network, &model, &hud, settled);
 
     let rgba: Vec<u8> = scene
         .pixmap()

@@ -43,8 +43,24 @@ pub const REMOTE_SLOT: f64 = 62.0;
 pub const MIN_REMOTE_SLOT: f64 = 34.0;
 /// Horizontal spacing between remote columns.
 pub const REMOTE_COLUMN_PITCH: f64 = 200.0;
-/// Left margin for the first column of remote hosts.
-pub const LEFT_MARGIN: f64 = 96.0;
+/// Left margin for the leftmost hop guide line.
+pub const HOP_LEFT_MARGIN: f64 = 76.0;
+/// Left inset of the bucket for hosts whose distance is unknown or beyond the
+/// last guide line.
+pub const FAR_LEFT_MARGIN: f64 = 22.0;
+/// Number of vertical hop guide lines.
+pub const HOP_LINES: usize = 15;
+/// The rightmost guide line sits this fraction of the window width in from the
+/// right edge; the rest are spaced evenly leftward from it.
+pub const HOP_RIGHT_FRACTION: f64 = 0.25;
+/// Seconds a circle takes to slide from the left edge onto its guide line.
+pub const HOP_SLIDE_SECONDS: f64 = 1.2;
+/// Vertical room a detail line needs under a circle.
+pub const DETAIL_ROOM: f64 = 30.0;
+/// Bottom-left corner kept clear of remote circles for the traffic colour key.
+pub const LEGEND_RESERVE: f64 = 150.0;
+/// Guide lines this far from the left edge have to stop above the colour key.
+pub const LEGEND_WIDTH: f64 = 210.0;
 /// Vertical room kept at the top of the display for the HUD text.
 pub const HUD_RESERVE: f64 = 96.0;
 
@@ -90,6 +106,34 @@ pub struct PlacedRemote {
     pub center: Point,
     pub radius: f64,
     pub host: RemoteHost,
+    /// Guide line this host sits on, `None` for the left-edge bucket.
+    pub slot: Option<usize>,
+}
+
+/// One vertical hop guide line and the hop count it stands for.
+#[derive(Debug, Clone)]
+pub struct HopLine {
+    pub x: f64,
+    pub hops: usize,
+}
+
+/// X positions of the guide lines, index 0 being the 1-hop line (rightmost).
+#[must_use]
+pub fn hop_line_positions(width: f64) -> Vec<f64> {
+    let right = width * (1.0 - HOP_RIGHT_FRACTION);
+    let left = HOP_LEFT_MARGIN.min(right);
+    let pitch = (right - left) / (HOP_LINES - 1) as f64;
+    (0..HOP_LINES).map(|i| right - i as f64 * pitch).collect()
+}
+
+/// The guide line index for a hop count, or `None` when the host belongs at the
+/// left edge: distance unknown, or further than the last line.
+#[must_use]
+pub fn hop_slot(hops: Option<u32>) -> Option<usize> {
+    match hops {
+        Some(h) if (1..=HOP_LINES as u32).contains(&h) => Some((h - 1) as usize),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -105,9 +149,18 @@ pub struct Layout {
     pub label_budget: f64,
     /// Bounding box actually used, for the "fit" readout in the HUD.
     pub used: Rect,
+    /// The hop guide lines, right to left.
+    pub hop_lines: Vec<HopLine>,
+    /// X of the left-edge bucket.
+    pub far_x: f64,
+    /// Vertical room under a circle for its detail line, 0 when there is none.
+    pub detail_budget: f64,
 }
 
 /// Places every shape for the current frame.
+///
+/// `now` drives the slide-in animation that carries a circle from the left edge
+/// onto its guide line once the distance becomes known.
 #[must_use]
 pub fn build(
     width: f64,
@@ -115,6 +168,7 @@ pub fn build(
     network: &LocalNetwork,
     remotes: &[RemoteHost],
     lan: &[LanHost],
+    now: std::time::Instant,
 ) -> Layout {
     let mut layout = Layout::default();
     let vertical_pad = 40.0;
@@ -124,62 +178,158 @@ pub fn build(
     layout.host = Some(host);
     layout.lan = Some(lan_circle);
 
-    // Remote grid: fill columns left to right, shrinking the vertical slot
-    // before dropping any host. Columns must clear both right-hand shapes.
-    let mut ordered: Vec<&RemoteHost> = remotes.iter().collect();
-    ordered.sort_by(|a, b| {
+    let positions = hop_line_positions(width);
+    layout.far_x = FAR_LEFT_MARGIN;
+    layout.hop_lines = positions
+        .iter()
+        .enumerate()
+        .map(|(i, x)| HopLine { x: *x, hops: i + 1 })
+        .collect();
+
+    // Bucket hosts by guide line, freshest first so the rows that matter sit on
+    // top. Hosts with no usable TTL reading share the left-edge bucket.
+    let mut by_slot: Vec<Vec<&RemoteHost>> = vec![Vec::new(); HOP_LINES];
+    let mut far: Vec<&RemoteHost> = Vec::new();
+    for host in remotes {
+        match hop_slot(host.hops) {
+            Some(i) => by_slot[i].push(host),
+            None => far.push(host),
+        }
+    }
+    sort_fresh(&mut far);
+    for bucket in &mut by_slot {
+        sort_fresh(bucket);
+    }
+
+    // One vertical pitch everywhere so rows line up across the display. It
+    // shrinks to fit the tallest bucket before any host is dropped.
+    let grid_top = HUD_RESERVE + 8.0;
+    let grid_bottom = height - vertical_pad;
+    let tallest = by_slot
+        .iter()
+        .map(Vec::len)
+        .chain(std::iter::once(far.len()))
+        .max()
+        .unwrap_or(0);
+    let band = (grid_bottom - grid_top).max(MIN_REMOTE_SLOT);
+
+    // Shrink the row pitch until the tallest bucket fits the full-height band;
+    // bands narrowed by the right-hand shapes drop rows on their own.
+    let mut slot = REMOTE_SLOT;
+    if tallest > (band / slot).floor() as usize {
+        slot = (band / tallest as f64).clamp(MIN_REMOTE_SLOT, REMOTE_SLOT);
+    }
+    // The guide-line pitch is tighter than the row pitch once 15 lines share
+    // the window, so it bounds the circle radius; otherwise neighbouring lines'
+    // circles would touch.
+    let line_pitch = positions
+        .get(1)
+        .map(|p| positions[0] - p)
+        .unwrap_or(REMOTE_COLUMN_PITCH);
+    let radius = (slot.min(line_pitch) * 0.34).clamp(8.0, REMOTE_RADIUS);
+
+    // Each line gets its own vertical band: a line that passes behind the host
+    // panel or the local-network circle stops short of it, so circles on that
+    // line never sit on top of those shapes.
+    let lan = layout.lan.clone().unwrap();
+    let panel = layout.host.clone().unwrap();
+    let band_for = |x: f64| -> (f64, f64) {
+        let mut bottom = grid_bottom;
+        let dx = x - lan.center.x;
+        if dx.abs() < lan.radius {
+            let half = (lan.radius * lan.radius - dx * dx).sqrt();
+            bottom = bottom.min(lan.center.y - half - radius - 6.0);
+        }
+        if x > panel.rect.x0 - radius {
+            bottom = bottom.min(panel.rect.y1 - radius - 6.0);
+        }
+        // The colour key owns the bottom-left corner.
+        if x < LEGEND_WIDTH {
+            bottom = bottom.min(height - LEGEND_RESERVE);
+        }
+        (grid_top + radius, (bottom - radius).max(grid_top + radius))
+    };
+
+    let mut place = |x: f64, bucket: &Vec<&RemoteHost>, slot_index: Option<usize>| {
+        if bucket.is_empty() {
+            return;
+        }
+        let (top, bottom) = band_for(x);
+        // Each line fits as many rows as its own band allows.
+        let room = ((bottom - top) / slot).floor() as usize + 1;
+        let shown = bucket.len().min(room.max(1));
+        let height_used = (shown - 1) as f64 * slot;
+        let start = (top + ((bottom - top) - height_used) / 2.0).max(top);
+        for (i, host) in bucket.iter().take(shown).enumerate() {
+            layout.remotes.push(PlacedRemote {
+                center: slide_in(x, start + i as f64 * slot, host, now),
+                radius,
+                host: (*host).clone(),
+                slot: slot_index,
+            });
+        }
+        layout.hidden += bucket.len() - shown;
+    };
+
+    place(layout.far_x, &far, None);
+    for (i, x) in positions.iter().enumerate() {
+        place(*x, &by_slot[i], Some(i));
+    }
+
+    layout.slot = slot;
+    // Labels sit centred under their circle, where they get the whole guide-line
+    // pitch to work in; beside the circle there is barely any room once 15 lines
+    // share the window.
+    layout.label_budget = (line_pitch - 6.0).max(0.0);
+    // The per-host detail line only earns space when rows are tall enough to
+    // hold it under the address.
+    layout.detail_budget = if slot - radius * 2.0 >= DETAIL_ROOM {
+        DETAIL_ROOM
+    } else {
+        0.0
+    };
+
+    layout.used = bounds(&layout, width, height);
+    layout
+}
+
+fn sort_fresh(bucket: &mut Vec<&RemoteHost>) {
+    bucket.sort_by(|a, b| {
         b.last_seen
             .cmp(&a.last_seen)
             .then_with(|| a.addr.cmp(&b.addr))
     });
+}
 
-    let lan = layout.lan.as_ref().unwrap();
-    let right_limit = layout
-        .host
-        .as_ref()
-        .unwrap()
-        .rect
-        .x0
-        .min(lan.center.x - lan.radius);
-
-    let grid_top = HUD_RESERVE + 8.0;
-    let usable_height = (height - grid_top - vertical_pad).max(MIN_REMOTE_SLOT);
-    let columns = {
-        let room = (right_limit - 24.0 - (LEFT_MARGIN - REMOTE_RADIUS)).max(0.0);
-        (room / REMOTE_COLUMN_PITCH).floor() as usize + 1
+/// Eases a circle in from the left-edge bucket onto its guide line.
+///
+/// The clock starts when the distance is first learned, so a host seen only
+/// outbound waits at the edge until a reply reveals its TTL, then slides across
+/// instead of teleporting.
+fn slide_in(target_x: f64, target_y: f64, host: &RemoteHost, now: std::time::Instant) -> Point {
+    let Some(learned) = host.hops_learned_at else {
+        return Point {
+            x: target_x,
+            y: target_y,
+        };
     };
-
-    let mut slot = REMOTE_SLOT;
-    let mut slots = (usable_height / slot).floor() as usize;
-    if ordered.len() > slots * columns {
-        let rows = ordered.len().div_ceil(columns);
-        slot = (usable_height / rows as f64).clamp(MIN_REMOTE_SLOT, REMOTE_SLOT);
-        slots = (usable_height / slot).floor() as usize;
+    let elapsed = now
+        .checked_duration_since(learned)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let t = (elapsed / HOP_SLIDE_SECONDS).clamp(0.0, 1.0);
+    if t >= 1.0 {
+        return Point {
+            x: target_x,
+            y: target_y,
+        };
     }
-    slots = slots.max(1);
-    let radius = (REMOTE_RADIUS * (slot / REMOTE_SLOT)).max(10.0);
-
-    let column_height = (slots.min(ordered.len()) as f64 - 1.0) * slot;
-    let top_floor = grid_top + radius;
-    let top_ceiling = (height - vertical_pad - radius).max(top_floor);
-    let top = (height * 0.5 - column_height / 2.0).clamp(top_floor, top_ceiling);
-
-    for (i, host) in ordered.iter().take(slots * columns).enumerate() {
-        layout.remotes.push(PlacedRemote {
-            center: Point {
-                x: LEFT_MARGIN + (i / slots) as f64 * REMOTE_COLUMN_PITCH,
-                y: top + (i % slots) as f64 * slot,
-            },
-            radius,
-            host: (*host).clone(),
-        });
+    // ease-out cubic: leaves the edge briskly, settles onto the line.
+    let eased = 1.0 - (1.0 - t).powi(3);
+    Point {
+        x: FAR_LEFT_MARGIN + (target_x - FAR_LEFT_MARGIN) * eased,
+        y: target_y,
     }
-    layout.hidden = ordered.len().saturating_sub(slots * columns);
-    layout.slot = slot;
-    layout.label_budget = REMOTE_COLUMN_PITCH - radius * 2.0 - 16.0;
-
-    layout.used = bounds(&layout, width, height);
-    layout
 }
 
 /// The host panel: a tall rectangle in the upper right, one square per address.

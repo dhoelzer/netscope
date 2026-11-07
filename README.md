@@ -12,22 +12,25 @@ on all three platforms down to one native library.
 ## What you see
 
 ```
-   ( remote )          ┌─ this host ─────────┐
-       |               │ ┌──┐ 192.168.1.20   │
-   ( remote )          │ └──┘     (global)   │
-       |               │ ┌──┐ 10.20.0.5      │
-   ( remote ) ─────────│ └──┘     (global)   │
-       |               │ ┌──┐ 169.254.3.3    │
-       |               │ └──┘   (link-local) │
-       |               └──────────┬──────────┘
-       |                          |
-   ( remote )                     |
-                          ╭───────┴────────╮
-                          │   ◯      ◯     │
-                          │ local network  │
-                          │ 192.168.1.0/24 │
-                          ╰────────────────╯
+ hops  15   12    9   6  3 1                    ┌─ this host ─────────┐
+   |    |    |    |  |  | |                     │ ┌──┐ 192.168.1.20   │
+ ( remote )       ( remote )                    │ └──┘     (global)   │
+       |              |                         │ ┌──┐ 10.20.0.5      │
+   ( remote )         |                         │ └──┘     (global)   │
+       |              |                         │ ┌──┐ 169.254.3.3    │
+       |              |                         │ └──┘   (link-local) │
+       |              |                         └──────────┬──────────┘
+   ( remote )         |                                    |
+                      |                           ╭────────┴───────╮
+                      |                           │   ◯      ◯     │
+                      |                           │ local network  │
+                      |                           │ 192.168.1.0/24 │
+                      |                           ╰────────────────╯
 ```
+
+Remote hosts are placed on the guide line matching their inferred hop count, so
+a host one router away sits on line 1 and a host across the internet sits
+further left.
 
 * **Host panel (upper right)** — a vertical rectangle standing for the machine
   netscope runs on. Inside it, a stack of squares, one per address assigned to
@@ -35,9 +38,16 @@ on all three platforms down to one native library.
 * **Local-network circle (lower right)** — a large circle for the local network,
   containing one smaller circle for every other host seen on it, labelled with
   its address. The caption carries the discovered subnet(s).
-* **Remote circles (left columns)** — one per unique host seen that is neither a
+* **Remote circles (left side)** — one per unique host seen that is neither a
   local address nor on the local network. A circle stays on screen and fades out
   starting 30 s of real time after the last packet to or from that address.
+* **Distance guide lines** — 15 vertical dashed lines, labelled `1`–`15` along
+  the top, starting 25% of the window width in from the right edge and evenly
+  spaced across the rest. They mark logical distance from the local network:
+  a remote circle sits on the line matching the hop count implied by the TTL of
+  the packets it sends us (TTL 64 ⇒ 1 hop, 63 ⇒ 2, 128 ⇒ 1, and so on). Only
+  inbound packets count — the TTL *we* send says nothing about the path back.
+  A host we have never heard from directly is parked at the far left.
 * **Links** — one line per *connection*, from a remote circle to the *exact
   square* of the interface that carried the traffic, or out to the local-network
   circle when the remote reached another system on the LAN. Traffic between this
@@ -221,7 +231,7 @@ encoder would produce, and is git-ignored rather than committed.
 ## Tests
 
 ```sh
-cargo test          # 66 tests: parsing, classification, fade timing, colours, layout, render, end-to-end replay
+cargo test          # 81 tests: parsing, classification, TTL/hop inference, fade timing, colours, layout, render, end-to-end replay
 cargo clippy --all-targets
 ```
 

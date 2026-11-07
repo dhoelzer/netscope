@@ -69,3 +69,23 @@ come from `vello_cpu::color::{AlphaColor, Srgb}`).
 * Interface square tints in `interface_tint` stay deliberately muted: a
   saturated fill there collides with protocol line colours and makes a line read
   as missing.
+
+## Distance by TTL
+
+* `Frame.ttl` carries the IPv4 TTL / IPv6 hop limit; `Model::infer_hops` turns it
+  into a hop count. Only **inbound** packets from a remote reveal its distance —
+  the TTL *we* transmit is our own default and says nothing about the return
+  path, so outbound-only hosts have no inferred distance and park at the far left.
+* Common OS defaults are 64 (Linux/macOS), 63, 128 (Windows) and 255 (network
+  gear). Distance is `default - ttl`, so a TTL of 64 means 1 hop; `MAX_HOPS` (15)
+  is the ceiling, and a TTL implying more is clamped rather than dropped.
+* `layout::hop_line_positions` owns the 15 guide lines: the first sits 25% of the
+  width in from the right, the rest are evenly spaced to the left margin. Render
+  and tests both read it from there — never recompute the pitch in two places.
+* Dashes come from kurbo (`Stroke { dash_pattern, .. }`), not vello — see
+  `docs/reference/vello.md`. Set `Cap::Butt` or round caps lengthen every dash.
+* Label sizing is measured, not guessed: `Scene::remote_label_size` scales the
+  font down to fit `Layout::label_budget` so a full IPv4 address stays legible
+  instead of losing its last octet. `tests/render.rs` checks hop labels stay
+  separate at several window widths, which is what caught the axis caption
+  colliding with the hop numbers.

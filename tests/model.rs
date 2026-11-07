@@ -2,7 +2,7 @@
 
 use netscope::capture::Sample;
 use netscope::capture::parse::{Frame, Transport};
-use netscope::model::{FADE_SECONDS, FADE_TAIL_SECONDS, LINK_FADE_SECONDS, Model};
+use netscope::model::{FADE_SECONDS, FADE_TAIL_SECONDS, LINK_FADE_SECONDS, Model, infer_hops};
 use netscope::net::{AddressKind, LocalAddress, LocalNetwork};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
@@ -28,6 +28,15 @@ fn ip(s: &str) -> IpAddr {
     s.parse().unwrap()
 }
 
+/// Frame with an explicit arriving TTL, for distance tests.
+fn frame_ttl(src: &str, dst: &str, proto: u8, ttl: u8) -> Sample {
+    let mut f = frame(src, dst, proto);
+    f.ttl = ttl;
+    Sample { frame: f }
+}
+
+const HOST_A: &str = "192.168.1.20";
+
 fn frame(src: &str, dst: &str, proto: u8) -> Frame {
     Frame {
         src: ip(src),
@@ -40,6 +49,7 @@ fn frame(src: &str, dst: &str, proto: u8) -> Frame {
             Transport::Udp
         },
         wire_len: 60,
+        ttl: 64,
     }
 }
 
@@ -295,6 +305,7 @@ fn flows_carry_the_protocol_and_service_port_that_colour_the_line() {
                 dst_port: Some(443),
                 transport: Transport::Tcp,
                 wire_len: 60,
+                ttl: 64,
             },
         },
         &network,
@@ -315,6 +326,7 @@ fn flows_carry_the_protocol_and_service_port_that_colour_the_line() {
                 dst_port: Some(51000),
                 transport: Transport::Tcp,
                 wire_len: 60,
+                ttl: 64,
             },
         },
         &network,
@@ -345,6 +357,7 @@ fn different_services_to_one_remote_are_separate_lines() {
                         Transport::Udp
                     },
                     wire_len: 60,
+                    ttl: 64,
                 },
             },
             &network,
@@ -381,6 +394,7 @@ fn the_service_port_prefers_the_well_known_side() {
                 dst_port: Some(22),
                 transport: Transport::Tcp,
                 wire_len: 60,
+                ttl: 64,
             },
         },
         &network,
@@ -406,6 +420,7 @@ fn flow_cap_evicts_the_stalest_connections() {
                     dst_port: Some(1_024 + (i % 60_000) as u16),
                     transport: Transport::Udp,
                     wire_len: 60,
+                    ttl: 64,
                 },
             },
             &network,
@@ -429,6 +444,7 @@ fn icmp_flows_have_no_port() {
                 dst_port: None,
                 transport: Transport::Icmp,
                 wire_len: 60,
+                ttl: 64,
             },
         },
         &network,
@@ -527,4 +543,85 @@ fn host_cap_evicts_the_stalest_remotes() {
     assert!(model.remote_count() <= netscope::model::MAX_REMOTE_HOSTS);
     // The freshest host must survive.
     assert!(model.remotes().any(|h| h.addr == ip("203.0.113.0")));
+}
+
+// ---- distance inferred from TTL -------------------------------------------
+
+#[test]
+fn ttl_maps_to_hops_for_each_plausible_initial_value() {
+    // Initial 64: Linux, macOS, most network gear.
+    assert_eq!(infer_hops(64), Some(1));
+    assert_eq!(infer_hops(60), Some(4));
+    assert_eq!(infer_hops(32), Some(32));
+    // Initial 255: Cisco and other network gear.
+    assert_eq!(infer_hops(255), Some(1));
+    assert_eq!(infer_hops(251), Some(4));
+    assert_eq!(infer_hops(224), Some(31));
+    // Initial 128: Windows.
+    assert_eq!(infer_hops(128), Some(1));
+    assert_eq!(infer_hops(96), Some(32));
+}
+
+#[test]
+fn ttl_beyond_the_hop_ceiling_is_not_guessed_at() {
+    // 20 arriving could only mean 44 hops from 64, which is past the ceiling,
+    // and no larger initial value explains it within the ceiling either.
+    assert_eq!(infer_hops(20), None);
+    assert_eq!(infer_hops(0), None);
+    assert_eq!(infer_hops(1), None);
+    // 31 would need 33 hops from 64, 97 from 128, or 224 from 255: none fit.
+    assert_eq!(infer_hops(31), None);
+    // 32 is the first value that fits, at exactly the ceiling from 64.
+    assert_eq!(infer_hops(32), Some(32));
+}
+
+#[test]
+fn a_remote_lands_on_the_line_its_ttl_implies() {
+    let now = Instant::now();
+    let mut m = Model::default();
+    m.ingest(&frame_ttl("203.0.113.5", HOST_A, 6, 58), &net(), now);
+    let host = m
+        .remotes()
+        .find(|h| h.addr.to_string() == "203.0.113.5")
+        .unwrap();
+    assert_eq!(host.hops, Some(6));
+    // First packet was inbound, so there is nothing to animate in.
+    assert!(host.hops_learned_at.is_none());
+}
+
+#[test]
+fn outbound_only_traffic_leaves_the_distance_unknown() {
+    let now = Instant::now();
+    let mut m = Model::default();
+    // We sent this, so the TTL is one we chose, not one the network revealed.
+    m.ingest(&frame_ttl(HOST_A, "203.0.113.6", 6, 64), &net(), now);
+    let host = m
+        .remotes()
+        .find(|h| h.addr.to_string() == "203.0.113.6")
+        .unwrap();
+    assert_eq!(host.hops, None);
+    assert!(host.hops_learned_at.is_none());
+}
+
+#[test]
+fn a_reply_reveals_the_distance_and_starts_the_slide() {
+    let now = Instant::now();
+    let mut m = Model::default();
+    m.ingest(&frame_ttl(HOST_A, "203.0.113.7", 6, 64), &net(), now);
+    assert_eq!(
+        m.remotes()
+            .find(|h| h.addr.to_string() == "203.0.113.7")
+            .unwrap()
+            .hops,
+        None
+    );
+
+    let later = now + Duration::from_secs(2);
+    m.ingest(&frame_ttl("203.0.113.7", HOST_A, 6, 59), &net(), later);
+    let host = m
+        .remotes()
+        .find(|h| h.addr.to_string() == "203.0.113.7")
+        .unwrap();
+    assert_eq!(host.hops, Some(5));
+    assert_eq!(host.hops_learned_at, Some(later));
 }

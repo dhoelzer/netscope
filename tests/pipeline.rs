@@ -44,19 +44,26 @@ fn fixture_classifies_host_lan_and_remote_correctly() {
 
     let mut model = Model::default();
     let (seen, decoded) = replay(&network, &mut model);
-    assert_eq!(seen, 12, "fixture has 12 packets");
-    // ARP and the truncated frame are not IP, so 10 decode.
-    assert_eq!(decoded, 10);
+    assert_eq!(seen, 14, "fixture has 14 packets");
+    // ARP and the truncated frame are not IP, so 12 decode.
+    assert_eq!(decoded, 12);
 
     // Only 192.168.1.0/24 is declared local here, so the fixture's second
     // interface address 10.20.0.5 counts as a remote endpoint.
-    assert_eq!(model.remote_count(), 6);
+    assert_eq!(model.remote_count(), 8);
     assert_eq!(model.lan_count(), 2);
 
     let remote_addrs: Vec<String> = model.remotes().map(|h| h.addr.to_string()).collect();
     assert!(remote_addrs.contains(&"10.20.0.5".to_string()));
     assert!(remote_addrs.contains(&"203.0.113.9".to_string()));
-    for expected in ["93.184.216.34", "10.5.5.5", "2001:db8::1", "2001:db8::2"] {
+    for expected in [
+        "93.184.216.34",
+        "10.5.5.5",
+        "2001:db8::1",
+        "2001:db8::2",
+        "198.51.100.7",
+        "192.0.2.99",
+    ] {
         assert!(
             remote_addrs.contains(&expected.to_string()),
             "missing {expected}"

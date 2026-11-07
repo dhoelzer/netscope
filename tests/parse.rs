@@ -181,3 +181,44 @@ fn linktype_mapping() {
     assert_eq!(LinkLayer::from_pcap_value(113), LinkLayer::LinuxSll);
     assert_eq!(LinkLayer::from_pcap_value(127), LinkLayer::Unsupported(127));
 }
+
+#[test]
+fn ipv4_ttl_is_reported() {
+    let payload = tcp_header(1, 2);
+    let mut p = ipv4([192, 0, 2, 1], [192, 0, 2, 2], 6, &payload);
+    p[8] = 52;
+    let d = decode(LinkLayer::Ethernet, &ethernet(&p, 0x0800)).expect("decodes");
+    assert_eq!(d.ttl, 52);
+}
+
+#[test]
+fn ipv4_ttl_survives_header_options() {
+    // IHL 6: twenty bytes of options after the fixed header. TTL is in the
+    // fixed part, so it must still read from byte 8.
+    let payload = tcp_header(1, 2);
+    let mut p = ipv4([192, 0, 2, 1], [192, 0, 2, 2], 6, &payload);
+    p[0] = 0x46;
+    p.splice(20..20, std::iter::repeat_n(0x01, 4));
+    p[8] = 251;
+    // Total length has to account for the four extra option bytes.
+    let total = (20 + 4 + payload.len()) as u16;
+    p[2..4].copy_from_slice(&total.to_be_bytes());
+    let d = decode(LinkLayer::Ethernet, &ethernet(&p, 0x0800)).expect("decodes");
+    assert_eq!(d.ttl, 251);
+}
+
+#[test]
+fn ipv6_hop_limit_is_reported_as_ttl() {
+    let payload = tcp_header(8080, 80);
+    let src: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let dst: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    let mut p = vec![0x60, 0, 0, 0];
+    p.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    p.extend_from_slice(&[6, 251]);
+    p.extend_from_slice(&src);
+    p.extend_from_slice(&dst);
+    p.extend_from_slice(&payload);
+
+    let d = decode(LinkLayer::RawIp, &p).expect("ipv6 should decode");
+    assert_eq!(d.ttl, 251);
+}

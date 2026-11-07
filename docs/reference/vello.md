@@ -223,3 +223,39 @@ pages suggested:
   `.font_data(&FontData).font_size(px).hint(false).fill_glyphs(glyphs)`.
   `FontData::new(Blob::new(Arc::new(bytes)), 0)` — `Blob::new` wants
   `Arc<dyn AsRef<[u8]> + Send + Sync>`.
+
+## Dashed strokes: supported, via kurbo's `Stroke`
+
+`vello_cpu` 0.3.0 strokes paths through `kurbo::stroke_with(path, style,
+&StrokeOpts::default(), tolerance, ctx)` (`vello_common-0.3.0/src/flatten.rs`),
+so kurbo's dash fields **are** honoured. Grep for `dash` in `vello_cpu`/
+`vello_common` and you find nothing — the support lives entirely in `kurbo`
+(`kurbo-0.13.1/src/stroke.rs`: `dash_pattern`, `dash_offset`) — so the absence
+of the word in vello is *not* evidence that dashes are unsupported.
+
+```rust
+use vello_cpu::kurbo::{Cap, Stroke};
+
+ctx.set_stroke(Stroke {
+    dash_pattern: vec![5.0, 5.0].into(), // on/off lengths, repeating
+    start_cap: Cap::Butt,                // round caps lengthen every dash
+    end_cap: Cap::Butt,
+    ..Stroke::new(1.0)
+});
+ctx.stroke_path(&line_path(a, b));
+```
+
+Verified empirically: a `[5.0, 5.0]` pattern over a 180px line rasterises to 18
+runs / 126 lit px, not one solid run.
+
+API notes found along the way:
+* `Dashes` is a type alias for `SmallVec<[f64; 4]>`, not a struct — build it
+  with `vec![on, off].into()`. There is no `Dashes::new(vec, offset)`.
+* The dash offset field is `dash_offset`, not `start_offset`/`end_offset`.
+* `kurbo::Shape::to_path(tolerance)` needs the `Shape` trait in scope
+  (`use vello_cpu::kurbo::Shape;`), otherwise `Line::new(..).to_path(0.1)`
+  fails to resolve.
+* `RenderContext` has `stroke_path(&BezPath)` / `stroke_rect(&Rect)` — there is
+  no `stroke(&Shape)` overload, and no `clear()`; paint a full-size rect instead.
+* `Stroke::new(w)` is `const` and defaults to `Join::Round` + `Cap::Round` on
+  both ends, so set `Cap::Butt` explicitly when dash length must be exact.

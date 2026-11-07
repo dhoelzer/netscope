@@ -27,6 +27,37 @@ pub const LINK_FADE_SECONDS: f64 = 45.0;
 pub const MAX_REMOTE_HOSTS: usize = 400;
 /// Cap on tracked connections, which are keyed per service as well as per host.
 pub const MAX_FLOWS: usize = 2_000;
+/// Hop counts a remote host can be placed at. A path longer than this is not
+/// resolved to a line, and a TTL that implies more than this is unreadable.
+pub const MAX_HOPS: u32 = 32;
+/// Plausible initial TTLs, shortest first. The smallest one that exceeds the
+/// arriving TTL and leaves at most [`MAX_HOPS`] hops is the one we assume.
+///
+/// The gaps between these values (64 and 127) both exceed `MAX_HOPS`, so at most
+/// one candidate can ever be valid: the inference is never ambiguous.
+pub const INITIAL_TTLS: [u32; 3] = [64, 128, 255];
+
+/// Hops a packet travelled, inferred from the TTL it arrived with.
+///
+/// Returns `None` when no plausible initial TTL explains the value within
+/// [`MAX_HOPS`] -- the host is either further away than we model or the value is
+/// not worth trusting.
+#[must_use]
+pub fn infer_hops(ttl: u8) -> Option<u32> {
+    let ttl = u32::from(ttl);
+    for start in INITIAL_TTLS {
+        if ttl > start {
+            continue;
+        }
+        let hops = start - ttl;
+        if hops <= MAX_HOPS {
+            // A directly connected host arrives with its initial TTL intact,
+            // which is 0 hops by arithmetic but one hop on the display.
+            return Some(hops.max(1));
+        }
+    }
+    None
+}
 
 /// A host seen on the network that is neither us nor a LAN peer.
 #[derive(Debug, Clone)]
@@ -40,6 +71,15 @@ pub struct RemoteHost {
     /// Packets exchanged with LAN peers rather than with our own interfaces.
     pub lan_packets: u64,
     pub last_transport: Transport,
+    /// Hops from the local network, inferred from an inbound packet's TTL.
+    /// `None` until a packet arrives *from* this host, which is the only kind
+    /// of packet that carries a TTL worth reading.
+    pub hops: Option<u32>,
+    /// When the distance became known *after* the host was already on screen,
+    /// which is what starts the slide from the left edge onto its guide line.
+    /// `None` when the first packet already revealed it, so the host is placed
+    /// on its line at once with nothing to animate.
+    pub hops_learned_at: Option<Instant>,
 }
 
 /// A LAN peer that has been seen talking to us or to another LAN peer.
@@ -159,11 +199,30 @@ impl Model {
             bytes: 0,
             lan_packets: 0,
             last_transport: frame.transport,
+            hops: None,
+            hops_learned_at: None,
         });
+        // A host created by this very frame has not been on screen at the edge,
+        // so a distance read from the same frame needs no animation.
+        let existed_before = host.packets > 0;
         host.last_seen = now;
         host.packets += 1;
         host.bytes += u64::from(frame.wire_len);
         host.last_transport = frame.transport;
+        // Only a packet arriving *from* the remote carries a TTL that says
+        // something about distance; one we sent carries a TTL we chose.
+        let learned = (frame.src == remote)
+            .then(|| infer_hops(frame.ttl))
+            .flatten()
+            .filter(|h| Some(*h) != host.hops);
+        if let Some(hops) = learned {
+            host.hops = Some(hops);
+            // A host already sitting at the left edge has somewhere to slide
+            // from; one whose first packet was inbound is placed on its line.
+            if existed_before {
+                host.hops_learned_at = Some(now);
+            }
+        }
         if peer_location == Location::LocalNetwork {
             host.lan_packets += 1;
         }
