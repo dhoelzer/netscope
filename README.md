@@ -265,4 +265,16 @@ embedded with `include_bytes!` so the binary needs no font files at runtime.
 
 ## Licence
 
-MIT OR Apache-2.0. The bundled Roboto font is Apache-2.0.
+Copyright (C) 2026 David Hoelzer.
+
+GPL-3.0-or-later; see `LICENSE`.
+
+netscope is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License or (at your option) any later
+version. It is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See `LICENSE` for details.
+
+The bundled Roboto font (`assets/Roboto-Regular.ttf`) is Apache-2.0 and remains
+under those terms; see `assets/LICENSE-Roboto.txt`.

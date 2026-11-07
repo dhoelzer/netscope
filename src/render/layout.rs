@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// This file is part of netscope; see LICENSE.
 //! Where things go on screen.
 //!
 //! The host is a vertical rectangle in the upper right holding one square per

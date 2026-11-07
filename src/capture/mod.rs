@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// This file is part of netscope; see LICENSE.
 //! Packet sources: live capture on a device, or replay from a pcap savefile.
 //!
 //! `pcap::Capture<Active>` and `pcap::Capture<Offline>` are distinct types, so

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// This file is part of netscope; see LICENSE.
 //! Frame-decoding tests against synthetic packets (no network access needed).
 
 use netscope::capture::parse::{LinkLayer, Transport, decode};

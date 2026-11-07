@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// This file is part of netscope; see LICENSE.
 //! Headless live-capture smoke test: prints what pcap sees, no window needed.
 //!
 //!   cargo run --release --example capture-probe -- [DEVICE] [SECONDS]

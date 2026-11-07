@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// This file is part of netscope; see LICENSE.
 //! Text drawing through Vello CPU's glyph run API.
 //!
 //! `RenderContext::glyph_run` takes glyph *ids*, not text, so this module owns

@@ -132,3 +132,16 @@ come from `vello_cpu::color::{AlphaColor, Srgb}`).
 * Do not remove features from the working tree because they look unrelated to the
   task at hand. Hover tooltips were stripped as "scope creep" and had to be
   rebuilt; ask before deleting work you did not write.
+
+## Licence
+
+GPL-3.0-or-later, in `LICENSE`, copyright David Hoelzer. Every `.rs` file
+carries an `SPDX-License-Identifier` header, and
+`every_source_file_carries_the_license_header` in `tests/pipeline.rs` fails if a
+new file omits it — update its file count when adding sources.
+
+The repo was originally MIT OR Apache-2.0 and was relicensed GPL-3.0-or-later.
+All 221 dependencies are MIT/Apache/BSD/ISC/Zlib/Unlicense, which are compatible
+going *into* GPL; the reverse would not be, so do not add a GPL-only dependency
+without checking whether it also allows the wider set. The bundled Roboto font
+stays Apache-2.0.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// This file is part of netscope; see LICENSE.
 //! netscope: sniff the live network (or replay a pcap file) and draw who is
 //! talking to whom with Vello CPU.
 

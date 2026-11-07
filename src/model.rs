@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// This file is part of netscope; see LICENSE.
 //! The picture's data model: which hosts exist, where they belong, and how
 //! fresh their traffic is.
 //!

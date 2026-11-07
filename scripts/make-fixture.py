@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# This file is part of netscope; see LICENSE.
 #!/usr/bin/env python3
 """Regenerate fixtures/sample.pcap.
 

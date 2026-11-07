@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// This file is part of netscope; see LICENSE.
 //! The service a traffic line carries, and the colour it is drawn in.
 //!
 //! Kept free of Vello types so the model can record a service and the mapping

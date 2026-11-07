@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// This file is part of netscope; see LICENSE.
 //! Line colouring: protocol/port keys, distinctness, and stability.
 
 use netscope::capture::parse::Transport;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// This file is part of netscope; see LICENSE.
 //! netscope — a live network packet visualiser.
 //!
 //! Capture (pcap) feeds a model of which hosts matter, and Vello CPU draws the

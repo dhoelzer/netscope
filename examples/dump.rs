@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// This file is part of netscope; see LICENSE.
 //! Renders one frame from a pcap savefile to a PNG for visual inspection.
 //!
 //!   cargo run --release --example dump -- out.png fixtures/sample.pcap \

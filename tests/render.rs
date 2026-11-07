@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// This file is part of netscope; see LICENSE.
 //! Layout placement and an end-to-end Vello CPU render.
 
 use netscope::capture::Sample;

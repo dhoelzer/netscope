@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// This file is part of netscope; see LICENSE.
 //! Minimal L2/L3/L4 decoding of a captured frame.
 //!
 //! We only need the IP endpoints (plus ports and a protocol tag for the HUD),

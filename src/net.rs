@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// This file is part of netscope; see LICENSE.
 //! The host's own addresses and the local networks they imply.
 //!
 //! Two sources are merged: `if_addrs` (the OS interface table, which knows
