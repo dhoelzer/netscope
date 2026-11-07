@@ -44,14 +44,17 @@ fn fixture_classifies_host_lan_and_remote_correctly() {
 
     let mut model = Model::default();
     let (seen, decoded) = replay(&network, &mut model);
-    assert_eq!(seen, 8, "fixture has 8 packets");
-    // ARP and the truncated frame are not IP, so 6 decode.
-    assert_eq!(decoded, 6);
+    assert_eq!(seen, 9, "fixture has 9 packets");
+    // ARP and the truncated frame are not IP, so 7 decode.
+    assert_eq!(decoded, 7);
 
-    assert_eq!(model.remote_count(), 4);
+    // Only 192.168.1.0/24 is declared local here, so the fixture's second
+    // interface address 10.20.0.5 counts as a remote endpoint.
+    assert_eq!(model.remote_count(), 5);
     assert_eq!(model.lan_count(), 2);
 
     let remote_addrs: Vec<String> = model.remotes().map(|h| h.addr.to_string()).collect();
+    assert!(remote_addrs.contains(&"10.20.0.5".to_string()));
     for expected in ["93.184.216.34", "10.5.5.5", "2001:db8::1", "2001:db8::2"] {
         assert!(
             remote_addrs.contains(&expected.to_string()),
@@ -118,8 +121,8 @@ fn fixture_replay_renders_without_panicking() {
 
     // Every remote in the model should have been placed on the left half.
     assert_eq!(placed.remotes.len(), model.remote_count());
-    let host = placed.host.as_ref().expect("host circle");
-    assert!(placed.remotes.iter().all(|r| r.center.x < host.center.x));
+    let host = placed.host.as_ref().expect("host panel");
+    assert!(placed.remotes.iter().all(|r| r.center.x < host.rect.x0));
 }
 
 #[test]

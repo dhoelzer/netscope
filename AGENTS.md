@@ -7,7 +7,7 @@ rendering in a `winit` window via `softbuffer`.
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"   # rustup toolchain, needs Rust >= 1.89
-cargo test                             # 39 tests
+cargo test                             # 46 tests
 cargo clippy --all-targets             # must stay clean
 cargo fmt                              # not --check; CI-less repo, keep formatted
 cargo run --quiet -- --list-devices    # does not need capture permission
@@ -43,4 +43,13 @@ come from `vello_cpu::color::{AlphaColor, Srgb}`).
   circle only and must never create a remote circle.
 * `render/layout.rs` is pure geometry and unit-testable; `render/mod.rs` only
   draws. Layout wraps remotes into columns and reports overflow in
-  `Layout::hidden` — never silently drop a host without incrementing it.
+  `Layout::hidden` (and `PlacedLan::hidden` for LAN peers) — never silently drop
+  a host without incrementing the counter.
+* Screen regions are fixed: host panel upper-right, LAN circle lower-right,
+  remote columns on the left below `HUD_RESERVE`. `PlacedHost.rect` is the panel
+  and `PlacedInterface.rect` is one square per *address* (`network.addresses()`,
+  loopback included — not `display_addresses()`, which filters loopback out).
+  `PlacedLanHost.offset` is **relative to the LAN centre**, not absolute.
+* Link anchors go through `local_anchor` / `host_anchor` / `lan_anchor` so the
+  line leaves the exact square that carried the traffic. `rect_edge` does the
+  ray/rectangle intersection; `rim` does the circle case.

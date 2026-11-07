@@ -12,33 +12,38 @@ on all three platforms down to one native library.
 ## What you see
 
 ```
-        ( remote )  ( remote )  ( remote )
-             \          |          /
-              \         |         /
-               ╭─────────────────╮      ╭───────────────╮
-               │   ╭───────────╮ │      │               │
-               │   │  ╭─────╮  │ │      │   local       │
-               │   │  │ lo  │  │ │      │   network     │
-               │   │  ╰─────╯  │ │      │   192.168.1.0 │
-               │   ╰───────────╯ │      │      /24      │
-               │    host         │      │               │
-               ╰─────────────────╯      ╰───────────────╯
+   ( remote )          ┌─ this host ─────────┐
+       |               │ ┌──┐ 192.168.1.20   │
+   ( remote )          │ └──┘     (global)   │
+       |               │ ┌──┐ 10.20.0.5      │
+   ( remote ) ─────────│ └──┘     (global)   │
+       |               │ ┌──┐ 169.254.3.3    │
+       |               │ └──┘   (link-local) │
+       |               └──────────┬──────────┘
+       |                          |
+   ( remote )                     |
+                          ╭───────┴────────╮
+                          │   ◯      ◯     │
+                          │ local network  │
+                          │ 192.168.1.0/24 │
+                          ╰────────────────╯
 ```
 
-* **Host circle (middle-left)** — the machine netscope runs on. A smaller
-  labelled circle sits *inside* it for each address assigned to the host
-  (loopback innermost, then one ring per interface address).
-* **Local-network circle (right)** — addresses on the local network that belong
-  to *other* systems, labelled with the discovered subnet(s).
-* **Remote circles (left column)** — one per unique host seen that is neither a
+* **Host panel (upper right)** — a vertical rectangle standing for the machine
+  netscope runs on. Inside it, a stack of squares, one per address assigned to
+  the host, each labelled with the address and its kind.
+* **Local-network circle (lower right)** — a large circle for the local network,
+  containing one smaller circle for every other host seen on it, labelled with
+  its address. The caption carries the discovered subnet(s).
+* **Remote circles (left columns)** — one per unique host seen that is neither a
   local address nor on the local network. A circle stays on screen and fades out
   starting 30 s of real time after the last packet to or from that address.
-* **Links** — a line from a remote circle to the interface ring when the traffic
-  involved one of our own addresses, or out towards the local-network circle
-  when it involved another system on the LAN. When a LAN peer talks directly to
-  one of our interfaces, a line is drawn between that interface ring and the
-  local-network circle. LAN↔LAN traffic feeds the right circle; it never
-  creates a remote circle.
+* **Links** — a line from a remote circle to the *exact square* of the interface
+  that carried the traffic, or out to the local-network circle when the remote
+  reached another system on the LAN. Traffic between this host and the local
+  network draws a line between the host panel and the local-network circle.
+  LAN↔LAN traffic feeds the local-network circle; it never creates a remote
+  circle.
 
 When there are more remote hosts than fit in one column, the grid wraps into
 extra columns and tightens its spacing; anything that still cannot be drawn is
@@ -180,9 +185,9 @@ cargo run --release --example capture-probe -- eth0 5
 | `src/capture/mod.rs` | capture thread: live device or savefile replay, stats, backpressure |
 | `src/net.rs` | local interface/address discovery, subnet derivation, `Host` / `LocalNetwork` / `Remote` classification |
 | `src/model.rs` | remote + LAN host tables, 30 s fade clock, flow anchoring, pruning, host cap |
-| `src/render/layout.rs` | pure geometry: where every circle and link endpoint goes |
+| `src/render/layout.rs` | pure geometry: panel, squares, LAN circle, link endpoints |
 | `src/render/text.rs` | skrifa font metrics + label fitting (glifo draws the glyphs) |
-| `src/render/mod.rs` | Vello CPU scene: rings, nested interface circles, links, HUD |
+| `src/render/mod.rs` | Vello CPU scene: host panel, squares, LAN circle, links, HUD |
 | `src/main.rs` | winit window, softbuffer present, argument parsing |
 | `build.rs` | libpcap link/rpath hints (Homebrew keg-only, `NETSCOPE_LIBPCAP_DIR`) |
 | `docs/reference/` | distilled API notes for pcap, Vello, Rust/Cargo |
@@ -206,7 +211,7 @@ encoder would produce, and is git-ignored rather than committed.
 ## Tests
 
 ```sh
-cargo test          # 39 tests: parsing, classification, fade timing, layout, render, end-to-end replay
+cargo test          # 46 tests: parsing, classification, fade timing, layout, render, end-to-end replay
 cargo clippy --all-targets
 ```
 

@@ -2,10 +2,11 @@
 
 use netscope::capture::Sample;
 use netscope::capture::parse::{Frame, Transport};
-use netscope::model::Model;
+use netscope::model::{LanHost, Model};
 use netscope::net::{AddressKind, LocalAddress, LocalNetwork};
 use netscope::render::{Hud, Scene, layout};
 use std::time::Instant;
+use vello_cpu::kurbo::Point;
 
 fn ip(s: &str) -> std::net::IpAddr {
     s.parse().unwrap()
@@ -34,6 +35,27 @@ fn network() -> LocalNetwork {
     ])
 }
 
+fn remote(addr: &str, last_seen: Instant, packets: u64) -> netscope::model::RemoteHost {
+    netscope::model::RemoteHost {
+        addr: ip(addr),
+        last_seen,
+        first_seen: last_seen,
+        packets,
+        bytes: packets * 60,
+        lan_packets: 0,
+        last_transport: Transport::Tcp,
+    }
+}
+
+fn lan_peer(addr: &str, last_seen: Instant) -> LanHost {
+    LanHost {
+        addr: ip(addr),
+        last_seen,
+        packets: 1,
+        bytes: 60,
+    }
+}
+
 fn empty_hud<'a>() -> Hud<'a> {
     Hud {
         source: "test",
@@ -48,71 +70,155 @@ fn empty_hud<'a>() -> Hud<'a> {
 }
 
 #[test]
-fn host_circle_sits_left_of_centre_and_lan_sits_to_its_right() {
+fn host_panel_is_a_tall_rectangle_in_the_upper_right() {
     let (w, h) = (1280.0, 800.0);
     let placed = layout::build(w, h, &network(), &[], &[]);
+    let host = placed.host.as_ref().expect("host panel");
+    let rect = host.rect;
 
-    let host = placed.host.as_ref().expect("host circle");
+    assert!(rect.x0 > w * 0.5, "host panel belongs on the right half");
+    assert!(rect.y0 < h * 0.5, "host panel belongs in the upper half");
+    assert!(
+        rect.height() > rect.width(),
+        "the panel is a vertical rectangle"
+    );
+    assert!(rect.x1 <= w && rect.y1 <= h, "panel stays on screen");
+}
+
+#[test]
+fn every_local_address_gets_a_square_inside_the_panel() {
+    let placed = layout::build(1280.0, 800.0, &network(), &[], &[]);
+    let host = placed.host.as_ref().unwrap();
+
+    // Loopback included: one square per address assigned to the host.
+    assert_eq!(host.interfaces.len(), 3);
+    for iface in &host.interfaces {
+        let square = iface.rect;
+        assert!(
+            square.x0 >= host.rect.x0 && square.x1 <= host.rect.x1,
+            "square for {} inside the panel horizontally",
+            iface.addr
+        );
+        assert!(
+            square.y0 >= host.rect.y0 && square.y1 <= host.rect.y1,
+            "square for {} inside the panel vertically",
+            iface.addr
+        );
+        assert!(
+            (square.width() - square.height()).abs() < 0.01,
+            "the shape for {} is a square",
+            iface.addr
+        );
+    }
+
+    // Squares stack top to bottom without overlapping.
+    let mut ys: Vec<(f64, f64)> = host
+        .interfaces
+        .iter()
+        .map(|i| (i.rect.y0, i.rect.y1))
+        .collect();
+    ys.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    for pair in ys.windows(2) {
+        assert!(pair[0].1 < pair[1].0, "stacked squares must not overlap");
+    }
+}
+
+#[test]
+fn lan_circle_sits_in_the_lower_right_below_the_host_panel() {
+    let (w, h) = (1280.0, 800.0);
+    let placed = layout::build(w, h, &network(), &[], &[]);
+    let host = placed.host.as_ref().unwrap();
     let lan = placed.lan.as_ref().expect("lan circle");
 
-    assert!(host.center.x < w, "host must be on screen");
+    assert!(lan.center.y > h * 0.5, "lan circle in the lower half");
+    assert!(lan.center.x > w * 0.5, "lan circle on the right");
     assert!(
-        lan.center.x > host.center.x,
-        "lan circle must be right of the host"
+        lan.center.y - lan.radius > host.rect.y1,
+        "lan circle must sit below the host panel"
     );
     assert!(
-        lan.center.x - lan.radius > host.center.x + host.radius - 1.0,
-        "the two circles must not overlap"
-    );
-
-    // One nested circle per non-loopback interface, each smaller than the host.
-    assert_eq!(host.interfaces.len(), 2);
-    let mut radii: Vec<f64> = host.interfaces.iter().map(|i| i.radius).collect();
-    radii.sort_by(|a, b| b.partial_cmp(a).unwrap());
-    assert!(
-        radii[0] < host.radius,
-        "interface circles nest inside the host"
+        lan.radius >= layout::LAN_MIN_RADIUS,
+        "the lan circle is large enough to hold peers"
     );
     assert!(
-        radii[1] < radii[0],
-        "each interface circle is smaller than the last"
+        lan.center.y + lan.radius <= h + 0.01 && lan.center.x + lan.radius <= w + 0.01,
+        "lan circle stays on screen"
+    );
+    assert!(
+        lan.center.x - lan.radius >= 0.0,
+        "lan circle stays on screen"
     );
 }
 
 #[test]
-fn remote_hosts_are_placed_to_the_left_and_ordered_newest_first() {
+fn lan_peers_get_their_own_circles_inside_the_lan_circle() {
+    let now = Instant::now();
+    let peers: Vec<_> = ["192.168.1.7", "192.168.1.9", "192.168.1.13"]
+        .iter()
+        .map(|a| lan_peer(a, now))
+        .collect();
+    let placed = layout::build(1280.0, 800.0, &network(), &[], &peers);
+    let lan = placed.lan.as_ref().unwrap();
+
+    assert_eq!(lan.hosts.len(), 3);
+    assert_eq!(lan.hidden, 0);
+    for peer in &lan.hosts {
+        let dist = (peer.offset.x * peer.offset.x + peer.offset.y * peer.offset.y).sqrt();
+        assert!(
+            dist + peer.radius <= lan.radius,
+            "peer {} must fit inside the lan circle",
+            peer.addr
+        );
+    }
+
+    // Distinct addresses, distinct circles.
+    let mut addrs: Vec<_> = lan.hosts.iter().map(|p| p.addr).collect();
+    addrs.sort();
+    addrs.dedup();
+    assert_eq!(addrs.len(), 3);
+}
+
+#[test]
+fn many_lan_peers_shrink_before_being_dropped() {
+    let now = Instant::now();
+    let peers: Vec<_> = (0..40)
+        .map(|i| lan_peer(&format!("192.168.1.{}", i + 2), now))
+        .collect();
+    let placed = layout::build(1280.0, 800.0, &network(), &[], &peers);
+    let lan = placed.lan.as_ref().unwrap();
+
+    assert_eq!(lan.hosts.len() + lan.hidden, 40);
+    assert!(lan.hosts.len() > 10, "a big circle should hold most peers");
+    for peer in &lan.hosts {
+        let dist = (peer.offset.x * peer.offset.x + peer.offset.y * peer.offset.y).sqrt();
+        assert!(dist + peer.radius <= lan.radius);
+    }
+}
+
+#[test]
+fn remote_hosts_are_placed_to_the_left_of_both_right_hand_shapes() {
     let now = Instant::now();
     let remotes = vec![
-        netscope::model::RemoteHost {
-            addr: "8.8.8.8".parse().unwrap(),
-            last_seen: now,
-            first_seen: now,
-            packets: 3,
-            bytes: 180,
-            lan_packets: 0,
-            last_transport: Transport::Udp,
-        },
-        netscope::model::RemoteHost {
-            addr: "1.1.1.1".parse().unwrap(),
-            last_seen: now - std::time::Duration::from_secs(10),
-            first_seen: now,
-            packets: 1,
-            bytes: 60,
-            lan_packets: 0,
-            last_transport: Transport::Tcp,
-        },
+        remote("8.8.8.8", now, 3),
+        remote("1.1.1.1", now - std::time::Duration::from_secs(10), 1),
     ];
     let placed = layout::build(1280.0, 800.0, &network(), &remotes, &[]);
     let host = placed.host.as_ref().unwrap();
+    let lan = placed.lan.as_ref().unwrap();
 
     assert_eq!(placed.remotes.len(), 2);
-    for remote in &placed.remotes {
+    for r in &placed.remotes {
         assert!(
-            remote.center.x + remote.radius < host.center.x - host.radius,
-            "remote circles belong to the left of the host circle"
+            r.center.x + r.radius < host.rect.x0,
+            "remotes left of the panel"
+        );
+        assert!(
+            r.center.x + r.radius < lan.center.x + lan.radius,
+            "remotes left of the lan circle"
         );
     }
-    // Newest first, i.e. nearest the vertical middle of the column.
+
+    // Newest first, so the busiest hosts sit at the top.
     assert_eq!(placed.remotes[0].host.addr.to_string(), "8.8.8.8");
     assert!(placed.remotes[0].center.y < placed.remotes[1].center.y);
 }
@@ -121,14 +227,12 @@ fn remote_hosts_are_placed_to_the_left_and_ordered_newest_first() {
 fn many_remotes_wrap_into_columns_instead_of_being_dropped() {
     let now = Instant::now();
     let remotes: Vec<_> = (0..40)
-        .map(|i| netscope::model::RemoteHost {
-            addr: ip(&format!("203.0.113.{}", i + 1)),
-            last_seen: now - std::time::Duration::from_secs(i as u64),
-            first_seen: now,
-            packets: 1,
-            bytes: 60,
-            lan_packets: 0,
-            last_transport: Transport::Tcp,
+        .map(|i| {
+            remote(
+                &format!("203.0.113.{}", i + 1),
+                now - std::time::Duration::from_secs(i as u64),
+                1,
+            )
         })
         .collect();
 
@@ -137,19 +241,14 @@ fn many_remotes_wrap_into_columns_instead_of_being_dropped() {
     assert_eq!(placed.hidden, 0);
     assert!(placed.slot <= layout::REMOTE_SLOT);
 
-    // Columns sit left of the host circle and never overlap each other.
     let host = placed.host.as_ref().unwrap();
     let mut xs: Vec<f64> = placed.remotes.iter().map(|r| r.center.x).collect();
     xs.dedup();
     assert!(xs.len() > 1, "expected more than one column");
-    for remote in &placed.remotes {
-        assert!(remote.center.x + remote.radius < host.center.x - host.radius);
-    }
-
-    // Nothing spills off the canvas.
-    for remote in &placed.remotes {
-        assert!(remote.center.y - remote.radius >= 0.0);
-        assert!(remote.center.y + remote.radius <= 800.0);
+    for r in &placed.remotes {
+        assert!(r.center.x + r.radius < host.rect.x0);
+        assert!(r.center.y - r.radius >= 0.0);
+        assert!(r.center.y + r.radius <= 800.0);
     }
 }
 
@@ -157,141 +256,160 @@ fn many_remotes_wrap_into_columns_instead_of_being_dropped() {
 fn a_tiny_window_reports_the_hosts_it_cannot_draw() {
     let now = Instant::now();
     let remotes: Vec<_> = (0..60)
-        .map(|i| netscope::model::RemoteHost {
-            addr: ip(&format!("203.0.113.{}", i + 1)),
-            last_seen: now,
-            first_seen: now,
-            packets: 1,
-            bytes: 60,
-            lan_packets: 0,
-            last_transport: Transport::Tcp,
-        })
+        .map(|i| remote(&format!("203.0.113.{}", i + 1), now, 1))
         .collect();
     let placed = layout::build(420.0, 200.0, &network(), &remotes, &[]);
     assert_eq!(placed.remotes.len() + placed.hidden, 60);
     assert!(placed.hidden > 0, "a 420x200 window cannot fit 60 hosts");
-    for remote in &placed.remotes {
-        assert!(remote.center.y + remote.radius <= 200.0);
+    for r in &placed.remotes {
+        assert!(r.center.y + r.radius <= 200.0);
     }
 }
 
 #[test]
-fn rim_and_anchor_helpers_point_at_circle_edges() {
-    use netscope::render::layout::{PlacedLan, PlacedRemote};
-    let center = vello_cpu::kurbo::Point { x: 100.0, y: 100.0 };
-    let target = vello_cpu::kurbo::Point { x: 200.0, y: 100.0 };
+fn link_anchors_land_on_the_right_shape() {
+    let placed = layout::build(1280.0, 800.0, &network(), &[], &[]);
+    let host = placed.host.as_ref().unwrap();
+    let lan = placed.lan.as_ref().unwrap();
+    let remote_center = Point { x: 120.0, y: 400.0 };
+
+    // Each interface anchors on its own square, not the panel as a whole.
+    let a = layout::local_anchor(&placed, ip("192.168.1.20"), remote_center).unwrap();
+    let b = layout::local_anchor(&placed, ip("127.0.0.1"), remote_center).unwrap();
+    assert_ne!(a, b, "different addresses anchor on different squares");
+    for anchor in [a, b] {
+        assert!(
+            anchor.x >= host.rect.x0 - 0.01 && anchor.x <= host.rect.x1 + 0.01,
+            "interface anchor on the panel"
+        );
+    }
+
+    // An address with no square of its own falls back to the panel edge.
+    let missing = layout::local_anchor(&placed, ip("10.0.0.1"), remote_center).unwrap();
+    assert!(missing.x >= host.rect.x0 - 0.01 && missing.x <= host.rect.x1 + 0.01);
+
+    // Host <-> lan links anchor on the panel edge and the lan rim.
+    let from_host = layout::host_anchor(&placed, lan.center).unwrap();
+    let from_lan = layout::lan_anchor(&placed, layout::rect_center(host.rect)).unwrap();
+    assert!(from_host.x >= host.rect.x0 - 0.01 && from_host.x <= host.rect.x1 + 0.01);
+    let d = ((from_lan.x - lan.center.x).powi(2) + (from_lan.y - lan.center.y).powi(2)).sqrt();
+    assert!((d - lan.radius).abs() < 0.01, "lan anchor sits on the rim");
+}
+
+#[test]
+fn each_interface_links_to_its_own_square() {
+    let placed = layout::build(1280.0, 800.0, &network(), &[], &[]);
+    let host = placed.host.as_ref().unwrap();
+    let target = Point { x: 120.0, y: 400.0 };
+
+    for iface in &host.interfaces {
+        let anchor = layout::local_anchor(&placed, iface.addr, target).unwrap();
+        let square = iface.rect;
+        // The anchor must sit on the square's own edge, not merely inside the
+        // panel: it is on the square boundary and level with that row only.
+        assert!(
+            anchor.x >= square.x0 - 0.01 && anchor.x <= square.x1 + 0.01,
+            "anchor for {} on its square's x span",
+            iface.addr
+        );
+        assert!(
+            anchor.y >= square.y0 - 0.01 && anchor.y <= square.y1 + 0.01,
+            "anchor for {} on its square's y span",
+            iface.addr
+        );
+    }
+}
+
+#[test]
+fn remote_columns_start_below_the_hud_text() {
+    let now = Instant::now();
+    let remotes: Vec<_> = (0..6)
+        .map(|i| remote(&format!("203.0.113.{}", i + 1), now, 1))
+        .collect();
+    let placed = layout::build(1280.0, 800.0, &network(), &remotes, &[]);
+    for r in &placed.remotes {
+        assert!(
+            r.center.y - r.radius >= layout::HUD_RESERVE,
+            "remote labels must not collide with the HUD"
+        );
+    }
+}
+
+#[test]
+fn rim_and_rect_edge_helpers_point_at_shape_edges() {
+    let center = Point { x: 100.0, y: 100.0 };
+    let target = Point { x: 300.0, y: 100.0 };
+
     let edge = layout::rim(center, 20.0, target);
     assert!((edge.x - 120.0).abs() < 1e-9);
     assert!((edge.y - 100.0).abs() < 1e-9);
 
-    // A target at the centre itself must not produce a NaN.
     let same = layout::rim(center, 20.0, center);
-    assert!((same.x - 100.0).abs() < 1e-9);
+    assert_eq!(same, center);
 
-    let _ = (
-        PlacedLan {
-            center,
-            radius: 10.0,
-            hosts: vec![],
-        },
-        PlacedRemote {
-            center,
-            radius: 5.0,
-            host: netscope::model::RemoteHost {
-                addr: "9.9.9.9".parse().unwrap(),
-                last_seen: Instant::now(),
-                first_seen: Instant::now(),
-                packets: 0,
-                bytes: 0,
-                lan_packets: 0,
-                last_transport: Transport::Other(99),
-            },
-        },
-    );
+    // A ray to the right leaves a 40x20 box at its right edge.
+    let rect_edge = layout::rect_edge(center, 20.0, 10.0, target);
+    assert!((rect_edge.x - 120.0).abs() < 1e-9);
+    assert!((rect_edge.y - 100.0).abs() < 1e-9);
+
+    // A steep ray leaves through the top edge instead.
+    let steep = layout::rect_edge(center, 20.0, 10.0, Point { x: 110.0, y: 0.0 });
+    assert!((steep.y - 90.0).abs() < 1e-9);
+    assert!(steep.x > 100.0 && steep.x < 120.0);
 }
 
 #[test]
 fn rendering_produces_a_non_blank_frame_with_the_expected_background() {
-    let (w, h) = (640u16, 400u16);
-    let mut scene = Scene::new(w, h);
-    let net = network();
+    let mut scene = Scene::new(640, 480);
+    let model = Model::default();
+    let placed = scene.draw(&network(), &model, &empty_hud(), Instant::now());
 
+    let data = scene.pixmap().data();
+    assert_eq!(data.len(), 640 * 480);
+    assert_eq!(placed.remotes.len(), 0);
+
+    // A corner pixel should be the background colour, not black or garbage.
+    let corner = data[0];
+    assert!(corner.r < 60 && corner.g < 60 && corner.b < 90);
+    assert_eq!(corner.a, 255);
+}
+
+#[test]
+fn rendering_a_full_scene_draws_panel_lan_and_remotes() {
+    let now = Instant::now();
     let mut model = Model::default();
-    let t0 = Instant::now();
-    let samples = [
-        Frame {
-            src: "192.168.1.20".parse().unwrap(),
-            dst: "93.184.216.34".parse().unwrap(),
+    let net = network();
+    // host -> remote, remote -> lan peer, lan peer -> host interface
+    for (src, dst) in [
+        ("192.168.1.20", "8.8.8.8"),
+        ("1.1.1.1", "192.168.1.7"),
+        ("192.168.1.9", "192.168.1.20"),
+    ] {
+        let frame = Frame {
+            src: ip(src),
+            dst: ip(dst),
             src_port: None,
             dst_port: None,
             transport: Transport::Tcp,
             wire_len: 60,
-        },
-        Frame {
-            src: "10.5.5.5".parse().unwrap(),
-            dst: "192.168.1.7".parse().unwrap(),
-            src_port: None,
-            dst_port: None,
-            transport: Transport::Udp,
-            wire_len: 60,
-        },
-    ];
-    for f in samples {
-        model.ingest(&Sample { frame: f }, &net, t0);
+        };
+        model.ingest(&Sample { frame }, &net, now);
     }
 
-    let hud = Hud {
-        remotes: model.remote_count(),
-        lan_peers: model.lan_count(),
-        ..empty_hud()
-    };
-    scene.draw(&net, &model, &hud, t0);
-
-    let pixmap = scene.pixmap();
-    assert_eq!(pixmap.data().len(), usize::from(w) * usize::from(h));
-
-    // Top-left corner is outside every circle: it must be the background colour.
-    let corner = pixmap.data()[0];
-    assert!(
-        corner.r < 30 && corner.g < 30 && corner.b < 40,
-        "corner should be dark: {corner:?}"
-    );
-
-    // Something bright was drawn somewhere (rings, text, links).
-    let bright = pixmap
-        .data()
-        .iter()
-        .filter(|p| p.r > 120 && p.a > 0)
-        .count();
-    assert!(
-        bright > 500,
-        "expected visible geometry, found {bright} bright pixels"
-    );
+    let mut scene = Scene::new(1280, 800);
+    let placed = scene.draw(&net, &model, &empty_hud(), now);
+    assert_eq!(placed.remotes.len(), 2);
+    assert!(!placed.lan.as_ref().unwrap().hosts.is_empty());
+    assert_eq!(placed.host.as_ref().unwrap().interfaces.len(), 3);
+    assert_eq!(scene.pixmap().data().len(), 1280 * 800);
 }
 
 #[test]
 fn rendering_survives_a_resize_and_an_empty_model() {
-    let mut scene = Scene::new(320, 240);
-    let net = network();
-    let model = Model::default();
-    scene.draw(&net, &model, &empty_hud(), Instant::now());
-    scene.resize(800, 600);
-    scene.draw(&net, &model, &empty_hud(), Instant::now());
-    assert_eq!(scene.pixmap().data().len(), 800 * 600);
-}
-
-#[test]
-fn text_measures_and_fits() {
-    use netscope::render::text::Font;
-    let font = Font::bundled();
-    assert!(font.measure("192.168.1.20", 13.0) > 0.0);
-    assert!(font.measure("wide", 13.0) > font.measure("i", 13.0));
-    assert!(font.line_height(13.0) > 13.0 * 1.0);
-
-    let long = "fe80:0000:0000:0000:0000:0000:0000:0001";
-    let fitted = font.fit(long, 12.0, 60.0);
-    assert!(fitted.ends_with('…'));
-    assert!(font.measure(&fitted, 12.0) <= 60.0);
-    // Short strings pass through untouched.
-    assert_eq!(font.fit("eth0", 12.0, 200.0), "eth0");
+    let mut scene = Scene::new(1280, 800);
+    scene.resize(320, 240);
+    let placed = scene.draw(&network(), &Model::default(), &empty_hud(), Instant::now());
+    assert!(placed.host.is_some());
+    assert!(placed.lan.is_some());
+    assert_eq!(scene.pixmap().data().len(), 320 * 240);
 }

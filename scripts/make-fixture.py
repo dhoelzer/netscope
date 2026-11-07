@@ -78,11 +78,15 @@ def build() -> bytes:
     lan_peer_b = "192.168.1.9"
     remote_web = "93.184.216.34"
     remote_dns = "10.5.5.5"
+    bridge = "10.20.0.5"
 
     host_mac, router_mac = "aabbccddeeff", "112233445566"
 
     packets = [
         ethernet(host_mac, router_mac, 0x0800, ipv4(host, remote_web, 6, tcp(51000, 443))),
+        # Second interface talking to a remote, so the demo shows links leaving
+        # different squares of the host panel.
+        ethernet(host_mac, router_mac, 0x0800, ipv4(bridge, remote_dns, 17, udp(5353, 53))),
         ethernet(router_mac, host_mac, 0x0800, ipv4(remote_web, host, 6, tcp(443, 51000))),
         ethernet(router_mac, host_mac, 0x0800, ipv4(remote_dns, lan_peer_a, 17, udp(53, 5353))),
         ethernet(host_mac, router_mac, 0x0800, ipv4(lan_peer_a, lan_peer_b, 6, tcp(9000, 22))),

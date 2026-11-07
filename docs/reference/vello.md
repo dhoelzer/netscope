@@ -205,6 +205,13 @@ pages suggested:
   `&[u8]`. So `data().len() == width * height`, and fields are `.r .g .b .a`.
 * `kurbo::Stroke` has no associated `DEFAULT` const in this version; use
   `Stroke::new(width)` or `Stroke { width, ..Stroke::default() }`.
+* `kurbo::Rect` (0.13) has **no `center()`** method — compute it from `x0/x1/y0/y1`.
+  It does have `width()`, `height()`, `union()`, `inset()`, `contains()`.
+  `BezPath` builds with `move_to`/`line_to`, not `push_move_to`/`push_line_to`;
+  for a straight segment `Line::new(a, b).to_path(0.1)` is shorter than
+  hand-building the path.
+* `stroke_rect` takes **one** argument (`&Rect`) — unlike `fill_rect` it has no
+  radii/second parameter.
 * `RenderContext::render(&mut pixmap, &mut resources)` takes the `Resources`
   directly — no wrapper or reborrow helper.
 * skrifa: `face.glyph_metrics(Size::new(px), LocationRef::default())` needs an

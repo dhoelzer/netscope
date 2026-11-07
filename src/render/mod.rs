@@ -9,8 +9,8 @@ use vello_cpu::{Pixmap, RenderContext, RenderSettings, Resources};
 
 use crate::capture::parse::Transport;
 use crate::model::{Model, RemoteHost};
-use crate::net::{LocalNetwork, format_address};
-use crate::render::layout::{Layout, REMOTE_RADIUS, describe_interface, lan_label};
+use crate::net::{AddressKind, LocalNetwork, format_address};
+use crate::render::layout::{LAN_LABEL_PITCH, Layout, describe_interface, lan_label};
 use crate::render::text::Font;
 
 type Paint = AlphaColor<Srgb>;
@@ -25,10 +25,15 @@ const HOST_BODY: Paint = rgb(0.16, 0.20, 0.28);
 const LAN_BODY: Paint = rgb(0.10, 0.22, 0.30);
 const LAN_RING: Paint = rgb(0.35, 0.72, 0.95);
 const REMOTE: Paint = rgb(0.98, 0.62, 0.25);
-const REMOTE_LAN: Paint = rgb(0.55, 0.80, 0.95);
 const TEXT: Paint = rgb(0.90, 0.93, 0.98);
 const DIM: Paint = rgb(0.55, 0.60, 0.68);
 const WARN: Paint = rgb(0.98, 0.75, 0.30);
+
+/// UI text sizes, scaled for readability at typical window sizes.
+const TITLE_SIZE: f32 = 16.0;
+const LABEL_SIZE: f32 = 14.5;
+const DETAIL_SIZE: f32 = 12.5;
+const HUD_SIZE: f32 = 14.5;
 
 /// Status line shown in the HUD.
 pub struct Hud<'a> {
@@ -102,8 +107,8 @@ impl Scene {
         self.ctx.set_paint(BG);
         self.ctx.fill_rect(&Rect::new(0.0, 0.0, w, h));
 
-        self.draw_links(&placed, model, network, now);
-        self.draw_host(&placed, network);
+        self.draw_links(&placed, model, now);
+        self.draw_host(&placed);
         self.draw_lan(&placed, network);
         self.draw_remotes(&placed, now);
         self.draw_hud(&placed, hud);
@@ -115,14 +120,7 @@ impl Scene {
 
     // ---- links -------------------------------------------------------------
 
-    fn draw_links(
-        &mut self,
-        placed: &Layout,
-        model: &Model,
-        _network: &LocalNetwork,
-        now: std::time::Instant,
-    ) {
-        let lan_center = placed.lan.as_ref().map(|l| l.center);
+    fn draw_links(&mut self, placed: &Layout, model: &Model, now: std::time::Instant) {
         for flow in model.flows() {
             let opacity = Model::opacity(flow.last_seen, now);
             if opacity <= 0.001 {
@@ -131,144 +129,116 @@ impl Scene {
             let Some(remote) = placed.remotes.iter().find(|r| r.host.addr == flow.remote) else {
                 continue;
             };
+            // The local end is the exact interface square that carried the
+            // traffic; a flow reached through the LAN anchors on that circle.
             let anchor = match flow.local {
                 Some(addr) => crate::render::layout::local_anchor(placed, addr, remote.center),
-                None => lan_center.map(|c| {
-                    crate::render::layout::rim(
-                        c,
-                        placed.lan.as_ref().unwrap().radius,
-                        remote.center,
-                    )
-                }),
+                None => crate::render::layout::lan_anchor(placed, remote.center),
             };
             let Some(anchor) = anchor else { continue };
             let start = crate::render::layout::rim(remote.center, remote.radius, anchor);
 
-            let width = 1.0 + (flow.packets.min(50) as f64 / 50.0) * 2.5;
             self.ctx.set_stroke(Stroke {
-                width,
+                width: link_width(flow.packets),
                 ..Stroke::default()
             });
             self.ctx.set_paint(with_alpha(REMOTE, opacity * 0.75));
             self.ctx.stroke_path(&line_path(start, anchor));
         }
 
-        // LAN peer <-> one of our interfaces: a link between the interface ring
-        // and the local-network circle, on the right of the host.
-        let Some(lan) = placed.lan.as_ref() else {
+        // Traffic between this host and the local network: one line between the
+        // host panel and the local-network circle, weighted by all such flows.
+        let (Some(host), Some(lan)) = (placed.host.as_ref(), placed.lan.as_ref()) else {
             return;
         };
+        let mut packets = 0u64;
+        let mut last_seen: Option<std::time::Instant> = None;
         for link in model.lan_links() {
-            let opacity = Model::opacity(link.last_seen, now);
-            if opacity <= 0.001 {
-                continue;
-            }
-            let Some(host) = placed.host.as_ref() else {
-                continue;
-            };
-            let Some(to_interface) =
-                crate::render::layout::local_anchor(placed, link.local, lan.center)
-            else {
-                continue;
-            };
-            let from_lan = crate::render::layout::rim(lan.center, lan.radius, host.center);
-
-            self.ctx.set_stroke(Stroke {
-                width: 1.0 + (link.packets.min(50) as f64 / 50.0) * 2.0,
-                ..Stroke::default()
+            packets += link.packets;
+            last_seen = Some(match last_seen {
+                Some(t) => t.max(link.last_seen),
+                None => link.last_seen,
             });
-            self.ctx.set_paint(with_alpha(LAN_RING, opacity * 0.8));
-            self.ctx.stroke_path(&line_path(from_lan, to_interface));
+        }
+        if let Some(last_seen) = last_seen {
+            let opacity = Model::opacity(last_seen, now);
+            if opacity > 0.001 {
+                let from = crate::render::layout::host_anchor(placed, lan.center)
+                    .unwrap_or(crate::render::layout::rect_center(host.rect));
+                if let Some(to) = crate::render::layout::lan_anchor(placed, from) {
+                    self.ctx.set_stroke(Stroke {
+                        width: link_width(packets),
+                        ..Stroke::default()
+                    });
+                    self.ctx.set_paint(with_alpha(LAN_RING, opacity * 0.85));
+                    self.ctx.stroke_path(&line_path(from, to));
+                }
+            }
         }
     }
 
-    // ---- host + interfaces -------------------------------------------------
+    // ---- host panel --------------------------------------------------------
 
-    fn draw_host(&mut self, placed: &Layout, network: &LocalNetwork) {
+    fn draw_host(&mut self, placed: &Layout) {
         let Some(host) = &placed.host else { return };
-        let center = host.center;
+        let panel = host.rect;
 
-        // Filled body so the nested rings read as one object.
         self.ctx.set_paint(HOST_BODY);
-        self.ctx
-            .fill_path(&Circle::new(center, host.radius).to_path(0.1));
-
+        self.ctx.fill_rect(&panel);
         self.ctx.set_stroke(Stroke::new(2.5));
         self.ctx.set_paint(HOST_RING);
-        self.ctx
-            .stroke_path(&Circle::new(center, host.radius).to_path(0.1));
+        self.ctx.stroke_rect(&panel);
 
-        // One ring per interface address, smallest = last listed.
-        for (i, iface) in host.interfaces.iter().enumerate() {
-            let tint = interface_tint(i);
-            self.ctx.set_paint(with_alpha(tint, 0.18));
-            self.ctx
-                .fill_path(&Circle::new(center, iface.radius).to_path(0.1));
-            self.ctx.set_stroke(Stroke::new(1.8));
-            self.ctx.set_paint(tint);
-            self.ctx
-                .stroke_path(&Circle::new(center, iface.radius).to_path(0.1));
-        }
-
-        // Labels: host name above, then one line per interface address.
-        let size = 13.0f32;
-        let line_h = f64::from(self.font.line_height(size));
-        let title = "this host";
         self.ctx.set_paint(HOST_RING);
-        self.font.draw_centered(
+        self.font.draw(
             &mut self.ctx,
             &mut self.resources,
-            center,
-            center.y - host.radius - 12.0 - f64::from(self.font.descent(size)),
-            title,
-            size,
+            Point {
+                x: panel.x0 + 14.0,
+                y: panel.y0 + 22.0,
+            },
+            "this host",
+            TITLE_SIZE,
         );
 
-        let mut y = center.y + host.radius + 18.0 + f64::from(self.font.ascent(size));
-        for iface in &host.interfaces {
+        for (i, iface) in host.interfaces.iter().enumerate() {
+            let tint = interface_tint(iface.kind);
+            let square = iface.rect;
+
+            self.ctx.set_paint(with_alpha(tint, 0.28));
+            self.ctx.fill_rect(&square);
+            self.ctx.set_stroke(Stroke::new(1.8));
+            self.ctx.set_paint(tint);
+            self.ctx.stroke_rect(&square);
+
             let label = self.font.fit(
                 &describe_interface(&crate::net::LocalAddress {
                     iface: iface.iface.clone(),
                     ip: iface.addr,
                     prefix: None,
-                    kind: crate::net::AddressKind::Global,
+                    kind: iface.kind,
                 }),
-                size,
-                320.0,
+                LABEL_SIZE,
+                host.label_budget as f32,
             );
-            let tint = interface_tint(
-                host.interfaces
-                    .iter()
-                    .position(|i| i.addr == iface.addr)
-                    .unwrap_or(0),
-            );
-            self.ctx.set_paint(tint);
+            self.ctx.set_paint(TEXT);
             self.font.draw(
                 &mut self.ctx,
                 &mut self.resources,
                 Point {
-                    x: center.x - 160.0,
-                    y,
+                    x: square.x1 + 10.0,
+                    y: square.y1
+                        - (square.height() - f64::from(self.font.line_height(LABEL_SIZE))) / 2.0
+                        - f64::from(self.font.descent(LABEL_SIZE)),
                 },
                 &label,
-                size,
+                LABEL_SIZE,
             );
-            y += line_h;
-        }
-
-        let loopbacks = network.loopback_addresses().len();
-        if loopbacks > 0 {
-            self.ctx.set_paint(DIM);
-            self.font.draw_centered(
-                &mut self.ctx,
-                &mut self.resources,
-                center,
-                center.y + 4.0,
-                &format!("{loopbacks} loopback"),
-                11.0,
-            );
+            let _ = i;
         }
     }
+
+    // ---- local network -----------------------------------------------------
 
     fn draw_lan(&mut self, placed: &Layout, network: &LocalNetwork) {
         let Some(lan) = &placed.lan else { return };
@@ -282,81 +252,102 @@ impl Scene {
         self.ctx
             .stroke_path(&Circle::new(center, lan.radius).to_path(0.1));
 
-        let size = 13.0f32;
+        let label = lan_label(network);
         self.ctx.set_paint(LAN_RING);
         self.font.draw_centered(
             &mut self.ctx,
             &mut self.resources,
             center,
-            center.y - lan.radius - 12.0 - f64::from(self.font.descent(size)),
-            "local network",
-            size,
-        );
-
-        let label = lan_label(network);
-        self.ctx.set_paint(TEXT);
-        self.font.draw_centered(
-            &mut self.ctx,
-            &mut self.resources,
-            center,
-            center.y + f64::from(self.font.ascent(size)) / 2.0,
+            center.y - lan.radius - 8.0 - f64::from(self.font.descent(TITLE_SIZE)),
             &label,
-            size,
+            TITLE_SIZE,
         );
 
-        let count = lan.hosts.len();
+        for peer in &lan.hosts {
+            let at = Point {
+                x: center.x + peer.offset.x,
+                y: center.y + peer.offset.y,
+            };
+            self.ctx.set_paint(with_alpha(LAN_RING, 0.30));
+            self.ctx
+                .fill_path(&Circle::new(at, peer.radius).to_path(0.1));
+            self.ctx.set_stroke(Stroke::new(1.4));
+            self.ctx.set_paint(LAN_RING);
+            self.ctx
+                .stroke_path(&Circle::new(at, peer.radius).to_path(0.1));
+
+            if peer.labeled {
+                let text = self.font.fit(
+                    &format_address(peer.addr),
+                    DETAIL_SIZE,
+                    (LAN_LABEL_PITCH - 6.0) as f32,
+                );
+                self.ctx.set_paint(TEXT);
+                self.font.draw_centered(
+                    &mut self.ctx,
+                    &mut self.resources,
+                    at,
+                    at.y + peer.radius + f64::from(self.font.ascent(DETAIL_SIZE)) - 2.0,
+                    &text,
+                    DETAIL_SIZE,
+                );
+            }
+        }
+
+        let hidden = lan.hidden;
         self.ctx.set_paint(DIM);
         self.font.draw_centered(
             &mut self.ctx,
             &mut self.resources,
             center,
-            center.y
-                + f64::from(self.font.ascent(size)) / 2.0
-                + f64::from(self.font.line_height(11.0)),
-            &format!("{count} peer{}", if count == 1 { "" } else { "s" }),
-            11.0,
+            center.y + lan.radius - 10.0,
+            &format!(
+                "{} peer{}{}",
+                lan.hosts.len(),
+                if lan.hosts.len() == 1 { "" } else { "s" },
+                if hidden > 0 {
+                    format!(" · {hidden} not drawn")
+                } else {
+                    String::new()
+                }
+            ),
+            DETAIL_SIZE,
         );
     }
 
+    // ---- remote hosts ------------------------------------------------------
+
     fn draw_remotes(&mut self, placed: &Layout, now: std::time::Instant) {
-        let size = 12.0f32;
         for remote in &placed.remotes {
             let opacity = Model::opacity(remote.host.last_seen, now);
             if opacity <= 0.001 {
                 continue;
             }
             let center = remote.center;
-            // A host that also talks to LAN peers gets a cooler tint so the two
-            // kinds of link are distinguishable.
-            let tint = if remote.host.lan_packets > 0 {
-                REMOTE_LAN
-            } else {
-                REMOTE
-            };
 
-            self.ctx.set_paint(with_alpha(tint, 0.22 * opacity));
+            self.ctx.set_paint(with_alpha(REMOTE, 0.22 * opacity));
             self.ctx
                 .fill_path(&Circle::new(center, remote.radius).to_path(0.1));
             self.ctx.set_stroke(Stroke::new(1.6));
-            self.ctx.set_paint(with_alpha(tint, opacity));
+            self.ctx.set_paint(with_alpha(REMOTE, opacity));
             self.ctx
                 .stroke_path(&Circle::new(center, remote.radius).to_path(0.1));
 
             let label = format_address(remote.host.addr);
-            let label = self.font.fit(&label, size, placed.label_budget as f32);
+            let label = self
+                .font
+                .fit(&label, LABEL_SIZE, placed.label_budget as f32);
             self.ctx.set_paint(with_alpha(TEXT, opacity));
-            let width = f64::from(self.font.measure(&label, size));
             self.font.draw(
                 &mut self.ctx,
                 &mut self.resources,
                 Point {
-                    x: center.x + REMOTE_RADIUS + 8.0,
-                    y: center.y + f64::from(self.font.ascent(size)) / 2.0,
+                    x: center.x + remote.radius + 8.0,
+                    y: center.y + f64::from(self.font.ascent(LABEL_SIZE)) / 2.0,
                 },
                 &label,
-                size,
+                LABEL_SIZE,
             );
-            let _ = width;
 
             let detail = format!(
                 "{} · {}",
@@ -368,19 +359,21 @@ impl Scene {
                 &mut self.ctx,
                 &mut self.resources,
                 Point {
-                    x: center.x + REMOTE_RADIUS + 8.0,
+                    x: center.x + remote.radius + 8.0,
                     y: center.y
-                        + f64::from(self.font.ascent(size)) / 2.0
-                        + f64::from(self.font.line_height(10.0)),
+                        + f64::from(self.font.ascent(LABEL_SIZE)) / 2.0
+                        + f64::from(self.font.line_height(DETAIL_SIZE)),
                 },
                 &detail,
-                10.0,
+                DETAIL_SIZE,
             );
         }
     }
 
+    // ---- HUD ---------------------------------------------------------------
+
     fn draw_hud(&mut self, placed: &Layout, hud: &Hud<'_>) {
-        let size = 12.0f32;
+        let size = HUD_SIZE;
         let line_h = f64::from(self.font.line_height(size));
         let x = 16.0f64;
         let mut y = 16.0 + f64::from(self.font.ascent(size));
@@ -432,33 +425,28 @@ impl Scene {
                 notice,
                 size,
             );
-            y += line_h;
         }
-
-        self.ctx.set_paint(DIM);
-        self.font.draw(
-            &mut self.ctx,
-            &mut self.resources,
-            Point { x, y },
-            "q / esc quit · space re-discover interfaces",
-            size,
-        );
-        let _ = placed;
     }
+}
+
+fn link_width(packets: u64) -> f64 {
+    1.4 + (packets.min(50) as f64 / 50.0) * 2.6
+}
+
+fn line_path(a: Point, b: Point) -> vello_cpu::kurbo::BezPath {
+    Line::new(a, b).to_path(0.1)
 }
 
 fn with_alpha(color: Paint, alpha: f32) -> Paint {
     color.with_alpha(alpha)
 }
 
-fn interface_tint(index: usize) -> Paint {
-    const PALETTE: [Paint; 4] = [
-        rgb(0.45, 0.85, 0.55),
-        rgb(0.95, 0.80, 0.35),
-        rgb(0.70, 0.55, 0.95),
-        rgb(0.95, 0.50, 0.60),
-    ];
-    PALETTE[index % PALETTE.len()]
+fn interface_tint(kind: AddressKind) -> Paint {
+    match kind {
+        AddressKind::Loopback => rgb(0.62, 0.66, 0.74),
+        AddressKind::LinkLocal => rgb(0.55, 0.80, 0.95),
+        AddressKind::Global => rgb(0.45, 0.90, 0.70),
+    }
 }
 
 fn transport_tag(transport: Transport) -> &'static str {
@@ -470,8 +458,4 @@ fn transport_tag(transport: Transport) -> &'static str {
         Transport::Other(_) => "ip",
         Transport::None => "ip",
     }
-}
-
-fn line_path(a: Point, b: Point) -> vello_cpu::kurbo::BezPath {
-    Line::new(a, b).to_path(0.1)
 }
