@@ -151,7 +151,7 @@ impl Scene {
         if let Some(at) = hover
             && let Some(target) = layout::hit_test(&placed, at)
         {
-            self.draw_tooltip(&placed, model, network, &target, now);
+            self.draw_tooltip(&placed, model, network, &target, at, now);
         }
 
         self.ctx.flush();
@@ -567,6 +567,7 @@ impl Scene {
         model: &Model,
         network: &LocalNetwork,
         hit: &layout::Hit,
+        at: Point,
         now: std::time::Instant,
     ) {
         let (title, lines) = match hit {
@@ -679,7 +680,7 @@ impl Scene {
             },
         };
 
-        let Some(anchor) = layout::hit_anchor(placed, hit) else {
+        let Some(anchor) = layout::hit_anchor(placed, hit, at) else {
             return;
         };
 

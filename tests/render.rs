@@ -1226,7 +1226,7 @@ fn every_hit_kind_has_an_anchor_for_the_card_to_sit_beside() {
     ];
     for hit in hits {
         assert!(
-            layout::hit_anchor(&placed, &hit).is_some(),
+            layout::hit_anchor(&placed, &hit, Point { x: 0.0, y: 0.0 }).is_some(),
             "{hit:?} should have an anchor"
         );
     }
@@ -1236,8 +1236,50 @@ fn every_hit_kind_has_an_anchor_for_the_card_to_sit_beside() {
         .find(|l| matches!(l.key, layout::LinkKey::Flow(..)))
         .expect("a flow line")
         .key;
-    let anchor = layout::hit_anchor(&placed, &layout::Hit::Link(key)).expect("line anchor");
+    let anchor = layout::hit_anchor(&placed, &layout::Hit::Link(key), Point { x: 0.0, y: 0.0 })
+        .expect("line anchor");
     assert!(anchor.width() > 0.0 && anchor.height() > 0.0);
+}
+
+#[test]
+fn a_line_tooltip_anchors_on_the_pointer_not_the_whole_line() {
+    let (_model, placed) = hover_scene();
+    let link = placed
+        .links
+        .iter()
+        .find(|l| matches!(l.key, layout::LinkKey::Flow(..)))
+        .expect("a flow line");
+    let key = link.key;
+
+    // Two points on the same line, far apart along it.
+    let near_a = Point {
+        x: link.a.x + (link.b.x - link.a.x) * 0.1,
+        y: link.a.y + (link.b.y - link.a.y) * 0.1,
+    };
+    let near_b = Point {
+        x: link.a.x + (link.b.x - link.a.x) * 0.9,
+        y: link.a.y + (link.b.y - link.a.y) * 0.9,
+    };
+    let at_a = layout::hit_anchor(&placed, &layout::Hit::Link(key), near_a).expect("anchor at a");
+    let at_b = layout::hit_anchor(&placed, &layout::Hit::Link(key), near_b).expect("anchor at b");
+
+    // Each anchor sits on its own pointer, not on a shared box spanning the line.
+    for (pointer, anchor) in [(near_a, at_a), (near_b, at_b)] {
+        let centre = Point {
+            x: (anchor.x0 + anchor.x1) / 2.0,
+            y: (anchor.y0 + anchor.y1) / 2.0,
+        };
+        let off_line = ((pointer.x - centre.x).powi(2) + (pointer.y - centre.y).powi(2)).sqrt();
+        assert!(
+            off_line <= link.width / 2.0 + 1.0,
+            "anchor centre {centre:?} should sit on the line under {pointer:?}, was {off_line} away"
+        );
+    }
+    let moved = ((at_a.x0 - at_b.x0).powi(2) + (at_a.y0 - at_b.y0).powi(2)).sqrt();
+    assert!(
+        moved > 10.0,
+        "the anchor should travel with the pointer, moved only {moved}px"
+    );
 }
 
 #[test]

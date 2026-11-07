@@ -79,7 +79,9 @@ however their TTL reads.
   the address, its kind and how many connections use it; a line shows the
   service and the traffic in each direction; the host panel and the
   local-network circle list what they stand for. The card is pushed clear of the
-  shape and of the window edges, so it never hides the thing being inspected.
+  shape and of the window edges, so it never hides the thing being inspected. A
+  line's card follows the pointer along the line rather than sitting at one fixed
+  end of it.
 
 When there are more remote hosts than fit in one column, the grid wraps into
 extra columns and tightens its spacing; anything that still cannot be drawn is

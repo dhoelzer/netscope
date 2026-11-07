@@ -108,6 +108,11 @@ come from `vello_cpu::color::{AlphaColor, Srgb}`).
 * Lines are matched by distance to the segment, not by bounding box — a thin
   diagonal line's bbox is mostly empty space. `LINK_HIT_TOLERANCE` is the band;
   it widens by the line's own stroke width.
+* A **line** tooltip anchors on the point of the line nearest the pointer, not
+  on the line's bounding box. A long diagonal link spans most of the window, so
+  a bbox anchor parks the card hundreds of pixels from the cursor and it never
+  moves as the pointer travels the line. `hit_anchor` takes the pointer for this
+  reason; circles and rects ignore it, since anchoring on the shape is right there.
 * Hit-testing uses `Layout::links`, filled **during** drawing by `stroke_fan`.
   That is why `draw_links` takes `&mut Layout`: a tooltip can only describe a
   line that was actually drawn this frame.

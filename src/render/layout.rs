@@ -732,18 +732,22 @@ pub fn describe_interface(addr: &LocalAddress) -> String {
 }
 
 /// Squared distance from `point` to the segment `a`..`b`.
-fn distance_sq_to_segment(point: Point, a: Point, b: Point) -> f64 {
+/// The point of segment `a`-`b` closest to `point`.
+fn closest_point_on_segment(point: Point, a: Point, b: Point) -> Point {
     let vx = b.x - a.x;
     let vy = b.y - a.y;
     let len_sq = vx * vx + vy * vy;
     if len_sq <= f64::EPSILON {
-        return (point.x - a.x).powi(2) + (point.y - a.y).powi(2);
+        return a;
     }
     let t = ((point.x - a.x) * vx + (point.y - a.y) * vy) / len_sq;
     let t = t.clamp(0.0, 1.0);
-    let dx = point.x - (a.x + t * vx);
-    let dy = point.y - (a.y + t * vy);
-    dx * dx + dy * dy
+    Point::new(a.x + t * vx, a.y + t * vy)
+}
+
+fn distance_sq_to_segment(point: Point, a: Point, b: Point) -> f64 {
+    let near = closest_point_on_segment(point, a, b);
+    (point.x - near.x).powi(2) + (point.y - near.y).powi(2)
 }
 
 /// The shape under the pointer, or `None` in empty space.
@@ -814,8 +818,13 @@ fn circle_box(center: Point, radius: f64) -> Rect {
 }
 
 /// The box a tooltip should be placed beside, so it points at what it describes.
+///
+/// `at` is where the pointer is. For a line it decides the anchor: the box sits
+/// on the point of the line nearest the pointer rather than spanning the whole
+/// segment, so the card follows the pointer along the line instead of jumping to
+/// wherever the line's bounding box happens to end.
 #[must_use]
-pub fn hit_anchor(layout: &Layout, hit: &Hit) -> Option<Rect> {
+pub fn hit_anchor(layout: &Layout, hit: &Hit, at: Point) -> Option<Rect> {
     match hit {
         Hit::Remote(addr) => layout
             .remotes
@@ -838,12 +847,9 @@ pub fn hit_anchor(layout: &Layout, hit: &Hit) -> Option<Rect> {
         Hit::HostPanel => layout.host.as_ref().map(|h| h.rect),
         Hit::LanCircle => layout.lan.as_ref().map(|l| circle_box(l.center, l.radius)),
         Hit::Link(key) => layout.links.iter().find(|l| l.key == *key).map(|l| {
-            Rect::new(
-                l.a.x.min(l.b.x),
-                l.a.y.min(l.b.y),
-                l.a.x.max(l.b.x),
-                l.a.y.max(l.b.y),
-            )
+            let near = closest_point_on_segment(at, l.a, l.b);
+            let half = (l.width / 2.0).max(2.0);
+            Rect::new(near.x - half, near.y - half, near.x + half, near.y + half)
         }),
     }
 }

@@ -80,6 +80,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settled = t0 + std::time::Duration::from_secs(2);
     let placed = scene.draw(&network, &model, &hud, settled, None);
     let hover = hover_target.as_deref().and_then(|target| match target {
+        // A literal "x,y" puts the pointer anywhere, e.g. partway along a line.
+        coord if coord.contains(',') => {
+            let (x, y) = coord.split_once(',')?;
+            Some(Point {
+                x: x.parse().ok()?,
+                y: y.parse().ok()?,
+            })
+        }
         "lan" => placed.lan.map(|l| Point {
             x: l.center.x,
             y: l.center.y,
