@@ -351,6 +351,7 @@ impl ApplicationHandler for App {
                 self.drain_capture();
                 self.model.prune(now);
                 self.model.enforce_cap();
+                self.model.enforce_flow_cap();
 
                 let hud = Hud {
                     source: &self.source_label,

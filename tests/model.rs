@@ -2,7 +2,7 @@
 
 use netscope::capture::Sample;
 use netscope::capture::parse::{Frame, Transport};
-use netscope::model::{FADE_SECONDS, FADE_TAIL_SECONDS, Model};
+use netscope::model::{FADE_SECONDS, FADE_TAIL_SECONDS, LINK_FADE_SECONDS, Model};
 use netscope::net::{AddressKind, LocalAddress, LocalNetwork};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
@@ -192,7 +192,7 @@ fn lan_to_lan_traffic_creates_no_lan_link() {
 }
 
 #[test]
-fn lan_links_are_pruned_with_the_same_clock_as_everything_else() {
+fn lan_links_are_pruned_on_the_line_clock_not_the_host_clock() {
     let network = net();
     let mut model = Model::default();
     let t0 = Instant::now();
@@ -205,11 +205,238 @@ fn lan_links_are_pruned_with_the_same_clock_as_everything_else() {
     );
     assert_eq!(model.lan_links().count(), 1);
 
-    model.prune(t0 + Duration::from_secs_f64(FADE_SECONDS + 1.0));
-    assert_eq!(model.lan_links().count(), 1, "still fading");
-
+    // Past the host circle's window but still inside the line's 45s fade.
     model.prune(t0 + Duration::from_secs_f64(FADE_SECONDS + FADE_TAIL_SECONDS + 0.5));
+    assert_eq!(model.lan_links().count(), 1, "line still fading");
+
+    model.prune(t0 + Duration::from_secs_f64(LINK_FADE_SECONDS + 0.5));
     assert_eq!(model.lan_links().count(), 0);
+}
+
+#[test]
+fn link_opacity_fades_immediately_and_reaches_zero_at_45s() {
+    let t0 = Instant::now();
+    assert_eq!(Model::link_opacity(t0, t0), 1.0);
+
+    // No hold period: already dimmed after a quarter of the window.
+    let quarter = Model::link_opacity(t0, t0 + Duration::from_secs_f64(LINK_FADE_SECONDS / 4.0));
+    assert!(
+        (quarter - 0.75).abs() < 1e-6,
+        "expected ~0.75 a quarter in, got {quarter}"
+    );
+
+    let mid = Model::link_opacity(t0, t0 + Duration::from_secs_f64(LINK_FADE_SECONDS / 2.0));
+    assert!((mid - 0.5).abs() < 1e-6, "expected ~0.5 halfway, got {mid}");
+
+    assert_eq!(
+        Model::link_opacity(t0, t0 + Duration::from_secs_f64(LINK_FADE_SECONDS)),
+        0.0
+    );
+    assert_eq!(
+        Model::link_opacity(t0, t0 + Duration::from_secs_f64(LINK_FADE_SECONDS * 2.0)),
+        0.0
+    );
+}
+
+#[test]
+fn a_further_packet_refreshes_a_line_to_full_brightness() {
+    let network = net();
+    let mut model = Model::default();
+    let t0 = Instant::now();
+
+    model.ingest(
+        &Sample {
+            frame: frame("192.168.1.20", "93.184.216.34", 6),
+        },
+        &network,
+        t0,
+    );
+    let at = t0 + Duration::from_secs(40);
+    let faded = model
+        .flows()
+        .map(|f| Model::link_opacity(f.last_seen, at))
+        .next()
+        .unwrap();
+    assert!(
+        faded < 0.15,
+        "after 40s the line should be nearly gone: {faded}"
+    );
+
+    // Another packet on the same connection resets it to full brightness.
+    model.ingest(
+        &Sample {
+            frame: frame("192.168.1.20", "93.184.216.34", 6),
+        },
+        &network,
+        at,
+    );
+    let refreshed = model
+        .flows()
+        .map(|f| Model::link_opacity(f.last_seen, at))
+        .next()
+        .unwrap();
+    assert_eq!(refreshed, 1.0);
+    assert_eq!(model.flows().count(), 1, "refresh reuses the same flow");
+}
+
+#[test]
+fn flows_carry_the_protocol_and_service_port_that_colour_the_line() {
+    let network = net();
+    let mut model = Model::default();
+    let t0 = Instant::now();
+
+    // Outbound HTTPS from our interface to the remote.
+    model.ingest(
+        &Sample {
+            frame: Frame {
+                src: ip("192.168.1.20"),
+                dst: ip("93.184.216.34"),
+                src_port: Some(51000),
+                dst_port: Some(443),
+                transport: Transport::Tcp,
+                wire_len: 60,
+            },
+        },
+        &network,
+        t0,
+    );
+    let flow = model.flows().next().unwrap();
+    assert_eq!(flow.service.transport, Transport::Tcp);
+    // The service port, not our ephemeral one, so both directions agree.
+    assert_eq!(flow.service.port, Some(443));
+
+    // The reply in the other direction keeps the same service port.
+    model.ingest(
+        &Sample {
+            frame: Frame {
+                src: ip("93.184.216.34"),
+                dst: ip("192.168.1.20"),
+                src_port: Some(443),
+                dst_port: Some(51000),
+                transport: Transport::Tcp,
+                wire_len: 60,
+            },
+        },
+        &network,
+        t0,
+    );
+    let flows: Vec<_> = model.flows().collect();
+    assert_eq!(flows.len(), 1, "both directions are one connection");
+    assert_eq!(flows[0].service.port, Some(443));
+}
+
+#[test]
+fn different_services_to_one_remote_are_separate_lines() {
+    let network = net();
+    let mut model = Model::default();
+    let t0 = Instant::now();
+
+    for (proto, dst_port) in [(6u8, 443u16), (17, 53), (6, 80)] {
+        model.ingest(
+            &Sample {
+                frame: Frame {
+                    src: ip("192.168.1.20"),
+                    dst: ip("93.184.216.34"),
+                    src_port: Some(50_000),
+                    dst_port: Some(dst_port),
+                    transport: if proto == 6 {
+                        Transport::Tcp
+                    } else {
+                        Transport::Udp
+                    },
+                    wire_len: 60,
+                },
+            },
+            &network,
+            t0,
+        );
+    }
+
+    // One circle, but one line per connection, each with its own colour.
+    assert_eq!(model.remote_count(), 1);
+    let flows: Vec<_> = model.flows().collect();
+    assert_eq!(flows.len(), 3);
+    let services: Vec<_> = flows.iter().map(|f| f.service).collect();
+    assert_eq!(
+        services
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3
+    );
+}
+
+#[test]
+fn the_service_port_prefers_the_well_known_side() {
+    let network = net();
+    let mut model = Model::default();
+    // A LAN peer reaching our ssh port: the line should read tcp/22, not the
+    // peer's ephemeral port.
+    model.ingest(
+        &Sample {
+            frame: Frame {
+                src: ip("192.168.1.7"),
+                dst: ip("192.168.1.20"),
+                src_port: Some(4514),
+                dst_port: Some(22),
+                transport: Transport::Tcp,
+                wire_len: 60,
+            },
+        },
+        &network,
+        Instant::now(),
+    );
+    let link = model.lan_links().next().unwrap();
+    assert_eq!(link.service.port, Some(22));
+    assert_eq!(link.service.label(), "tcp/22");
+}
+
+#[test]
+fn flow_cap_evicts_the_stalest_connections() {
+    let network = net();
+    let mut model = Model::default();
+    let t0 = Instant::now();
+    for i in 0..(netscope::model::MAX_FLOWS + 25) {
+        model.ingest(
+            &Sample {
+                frame: Frame {
+                    src: ip("192.168.1.20"),
+                    dst: ip("93.184.216.34"),
+                    src_port: Some(40_000),
+                    dst_port: Some(1_024 + (i % 60_000) as u16),
+                    transport: Transport::Udp,
+                    wire_len: 60,
+                },
+            },
+            &network,
+            t0 + Duration::from_secs(i as u64),
+        );
+    }
+    model.enforce_flow_cap();
+    assert_eq!(model.flows().count(), netscope::model::MAX_FLOWS);
+}
+
+#[test]
+fn icmp_flows_have_no_port() {
+    let network = net();
+    let mut model = Model::default();
+    model.ingest(
+        &Sample {
+            frame: Frame {
+                src: ip("192.168.1.20"),
+                dst: ip("93.184.216.34"),
+                src_port: None,
+                dst_port: None,
+                transport: Transport::Icmp,
+                wire_len: 60,
+            },
+        },
+        &network,
+        Instant::now(),
+    );
+    let flow = model.flows().next().unwrap();
+    assert_eq!(flow.service.transport, Transport::Icmp);
+    assert_eq!(flow.service.port, None);
 }
 
 #[test]
@@ -252,9 +479,13 @@ fn stale_hosts_are_pruned_only_after_the_fade_completes() {
     model.prune(t0 + Duration::from_secs_f64(FADE_SECONDS + 1.0));
     assert_eq!(model.remote_count(), 1);
 
-    // Past the fade tail: gone, and its flow goes with it.
+    // Past the fade tail: the circle is gone. The line outlives it, because
+    // lines fade on their own 45s clock.
     model.prune(t0 + Duration::from_secs_f64(FADE_SECONDS + FADE_TAIL_SECONDS + 0.5));
     assert_eq!(model.remote_count(), 0);
+    assert_eq!(model.flows().count(), 1, "line still fading");
+
+    model.prune(t0 + Duration::from_secs_f64(LINK_FADE_SECONDS + 0.5));
     assert_eq!(model.flows().count(), 0);
 }
 

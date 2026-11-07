@@ -8,5 +8,6 @@ pub mod error;
 pub mod model;
 pub mod net;
 pub mod render;
+pub mod service;
 
 pub use error::Error;

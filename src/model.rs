@@ -1,9 +1,11 @@
 //! The picture's data model: which hosts exist, where they belong, and how
 //! fresh their traffic is.
 //!
-//! Time is always the UI's arrival clock. A remote host stays on screen for
-//! [`FADE_SECONDS`] after its last packet, then fades out over
-//! [`FADE_TAIL_SECONDS`] before being dropped.
+//! Time is always the UI's arrival clock, on which two separate timers run: a
+//! host circle stays fully visible for [`FADE_SECONDS`] after its last packet
+//! and then fades over [`FADE_TAIL_SECONDS`], while a traffic line starts fading
+//! the moment it is drawn and is gone after [`LINK_FADE_SECONDS`]. Either timer
+//! is reset to full brightness by the next packet on that host or connection.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -12,13 +14,19 @@ use std::time::{Duration, Instant};
 use crate::capture::Sample;
 use crate::capture::parse::{Frame, Transport};
 use crate::net::{LocalNetwork, Location};
+use crate::service::Service;
 
 /// Seconds a remote host stays fully visible after its last packet.
 pub const FADE_SECONDS: f64 = 30.0;
 /// Extra seconds spent fading to nothing before the host is removed.
 pub const FADE_TAIL_SECONDS: f64 = 4.0;
+/// Seconds a traffic line takes to fade from full brightness to nothing. Unlike
+/// a host circle, a line begins fading as soon as it is drawn.
+pub const LINK_FADE_SECONDS: f64 = 45.0;
 /// Cap on tracked remote hosts, so a flood cannot exhaust memory.
 pub const MAX_REMOTE_HOSTS: usize = 400;
+/// Cap on tracked connections, which are keyed per service as well as per host.
+pub const MAX_FLOWS: usize = 2_000;
 
 /// A host seen on the network that is neither us nor a LAN peer.
 #[derive(Debug, Clone)]
@@ -43,6 +51,11 @@ pub struct LanHost {
     pub bytes: u64,
 }
 
+/// Identifies one traffic line: the two endpoints plus the connection they use.
+pub type FlowKey = (IpAddr, Option<IpAddr>, Service);
+/// Identifies one host-panel-to-LAN-circle line.
+pub type LanLinkKey = (IpAddr, IpAddr, Service);
+
 /// One observed endpoint pair, kept so links can be drawn and aged.
 #[derive(Debug, Clone)]
 pub struct Flow {
@@ -52,6 +65,10 @@ pub struct Flow {
     pub local: Option<IpAddr>,
     pub last_seen: Instant,
     pub packets: u64,
+    /// The connection this line represents: protocol plus service port. It
+    /// decides the line's colour and keeps the two directions of one
+    /// connection on a single line.
+    pub service: Service,
 }
 
 /// A LAN peer seen talking directly to one of our interfaces. Drawn as a link
@@ -62,14 +79,32 @@ pub struct LanLink {
     pub local: IpAddr,
     pub last_seen: Instant,
     pub packets: u64,
+    pub service: Service,
+}
+
+/// The port that names the service on a link, so both directions of one
+/// connection land on the same line and get the same colour.
+///
+/// Well-known ports win when only one side uses one; otherwise the smaller port
+/// is taken, which keeps an ephemeral-to-ephemeral pair stable in both
+/// directions. `None` when the protocol has no ports (ICMP, or a non-first
+/// fragment whose transport header was never parsed).
+#[must_use]
+fn service_port(frame: &Frame) -> Option<u16> {
+    let (a, b) = (frame.src_port?, frame.dst_port?);
+    match (a < 1024, b < 1024) {
+        (true, false) => Some(a),
+        (false, true) => Some(b),
+        _ => Some(a.min(b)),
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct Model {
     remotes: HashMap<IpAddr, RemoteHost>,
     lan: HashMap<IpAddr, LanHost>,
-    lan_links: HashMap<(IpAddr, IpAddr), LanLink>,
-    flows: HashMap<(IpAddr, Option<IpAddr>), Flow>,
+    lan_links: HashMap<LanLinkKey, LanLink>,
+    flows: HashMap<FlowKey, Flow>,
     pub frames_seen: u64,
     pub frames_decoded: u64,
 }
@@ -98,7 +133,7 @@ impl Model {
                     // A peer on our subnet that talked straight to one of our
                     // interfaces earns its own interface<->LAN-circle link.
                     if peer_location == Location::Host {
-                        self.note_lan_link(addr, peer, now);
+                        self.note_lan_link(addr, peer, now, &frame);
                     }
                 }
                 Location::Host => {}
@@ -147,25 +182,32 @@ impl Model {
             Location::Remote => None,
         };
 
-        let flow = self.flows.entry((remote, local)).or_insert_with(|| Flow {
-            remote,
-            local,
-            last_seen: now,
-            packets: 0,
-        });
+        let service = Service::new(frame.transport, service_port(frame));
+        let flow = self
+            .flows
+            .entry((remote, local, service))
+            .or_insert_with(|| Flow {
+                remote,
+                local,
+                last_seen: now,
+                packets: 0,
+                service,
+            });
         flow.last_seen = now;
         flow.packets += 1;
     }
 
-    fn note_lan_link(&mut self, peer: IpAddr, local: IpAddr, now: Instant) {
+    fn note_lan_link(&mut self, peer: IpAddr, local: IpAddr, now: Instant, frame: &Frame) {
+        let service = Service::new(frame.transport, service_port(frame));
         let link = self
             .lan_links
-            .entry((peer, local))
+            .entry((peer, local, service))
             .or_insert_with(|| LanLink {
                 peer,
                 local,
                 last_seen: now,
                 packets: 0,
+                service,
             });
         link.last_seen = now;
         link.packets += 1;
@@ -184,17 +226,19 @@ impl Model {
         let _ = frame;
     }
 
-    /// Drops hosts and flows whose fade window has fully elapsed.
+    /// Drops hosts and links whose fade window has fully elapsed. Circles and
+    /// lines run on different timers, so they are pruned on different horizons.
     pub fn prune(&mut self, now: Instant) {
-        let horizon = Duration::from_secs_f64(FADE_SECONDS + FADE_TAIL_SECONDS);
+        let host_horizon = Duration::from_secs_f64(FADE_SECONDS + FADE_TAIL_SECONDS);
+        let link_horizon = Duration::from_secs_f64(LINK_FADE_SECONDS);
         self.remotes
-            .retain(|_, h| now.duration_since(h.last_seen) < horizon);
+            .retain(|_, h| now.duration_since(h.last_seen) < host_horizon);
         self.lan
-            .retain(|_, h| now.duration_since(h.last_seen) < horizon);
+            .retain(|_, h| now.duration_since(h.last_seen) < host_horizon);
         self.lan_links
-            .retain(|_, l| now.duration_since(l.last_seen) < horizon);
+            .retain(|_, l| now.duration_since(l.last_seen) < link_horizon);
         self.flows
-            .retain(|_, f| now.duration_since(f.last_seen) < horizon);
+            .retain(|_, f| now.duration_since(f.last_seen) < link_horizon);
     }
 
     /// Evicts the stalest remotes once the cap is hit.
@@ -215,7 +259,25 @@ impl Model {
         }
     }
 
-    /// 1.0 while fresh, ramping to 0.0 across the fade window.
+    /// Evicts the stalest connections once the cap is hit. Connections are keyed
+    /// per service, so a single noisy host cannot crowd out the whole picture.
+    pub fn enforce_flow_cap(&mut self) {
+        if self.flows.len() <= MAX_FLOWS {
+            return;
+        }
+        let mut ordered: Vec<(Instant, FlowKey)> = self
+            .flows
+            .values()
+            .map(|f| (f.last_seen, (f.remote, f.local, f.service)))
+            .collect();
+        ordered.sort_unstable_by_key(|(t, _)| *t);
+        let excess = self.flows.len() - MAX_FLOWS;
+        for (_, key) in ordered.into_iter().take(excess) {
+            self.flows.remove(&key);
+        }
+    }
+
+    /// Host circle opacity: 1.0 while fresh, ramping to 0.0 across the fade tail.
     #[must_use]
     pub fn opacity(last_seen: Instant, now: Instant) -> f32 {
         let age = now.duration_since(last_seen).as_secs_f64();
@@ -225,6 +287,15 @@ impl Model {
             let over = age - FADE_SECONDS;
             (1.0 - over / FADE_TAIL_SECONDS).clamp(0.0, 1.0) as f32
         }
+    }
+
+    /// Traffic line opacity: full brightness at the last packet, fading linearly
+    /// to nothing over [`LINK_FADE_SECONDS`]. A new packet moves `last_seen`
+    /// forward, which is what refreshes a line back to full brightness.
+    #[must_use]
+    pub fn link_opacity(last_seen: Instant, now: Instant) -> f32 {
+        let age = now.duration_since(last_seen).as_secs_f64();
+        (1.0 - age / LINK_FADE_SECONDS).clamp(0.0, 1.0) as f32
     }
 
     pub fn remotes(&self) -> impl Iterator<Item = &RemoteHost> {

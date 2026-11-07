@@ -5,7 +5,8 @@ use netscope::capture::parse::{Frame, Transport};
 use netscope::model::{LanHost, Model};
 use netscope::net::{AddressKind, LocalAddress, LocalNetwork};
 use netscope::render::{Hud, Scene, layout};
-use std::time::Instant;
+use netscope::service::Service;
+use std::time::{Duration, Instant};
 use vello_cpu::kurbo::Point;
 
 fn ip(s: &str) -> std::net::IpAddr {
@@ -356,6 +357,218 @@ fn rim_and_rect_edge_helpers_point_at_shape_edges() {
     let steep = layout::rect_edge(center, 20.0, 10.0, Point { x: 110.0, y: 0.0 });
     assert!((steep.y - 90.0).abs() < 1e-9);
     assert!(steep.x > 100.0 && steep.x < 120.0);
+}
+
+/// Measures the `service`-coloured line in a rendered frame.
+///
+/// Every pixel is projected onto the ray from the background colour to the
+/// service colour; `t` is the blend weight along that ray. Returns the brightest
+/// such weight found, and how many pixels sit at a weight high enough to be a
+/// visible line. Anti-aliased text sits near t~0.07, so the presence threshold
+/// separates a real line from incidental tinting.
+fn line_signal(model: &Model, at: Instant, service: Service) -> (f64, usize) {
+    let mut scene = Scene::new(1280, 800);
+    let hud = Hud {
+        source: "test",
+        frames_seen: 1,
+        frames_decoded: 1,
+        remotes: model.remote_count(),
+        lan_peers: model.lan_count(),
+        quiet_for: 0.0,
+        fps: 0.0,
+        notice: None,
+    };
+    scene.draw(&network(), model, &hud, at);
+
+    let bg = (0.047f64, 0.063, 0.094);
+    let [tr, tg, tb] = service.rgb();
+    let (dr, dg, db) = (
+        f64::from(tr) - bg.0,
+        f64::from(tg) - bg.1,
+        f64::from(tb) - bg.2,
+    );
+    let denom = dr * dr + dg * dg + db * db;
+
+    let mut brightest = 0.0f64;
+    let mut present = 0usize;
+    for px in scene.pixmap().data() {
+        let (r, g, b) = (
+            f64::from(px.r) / 255.0 - bg.0,
+            f64::from(px.g) / 255.0 - bg.1,
+            f64::from(px.b) / 255.0 - bg.2,
+        );
+        let t = (r * dr + g * dg + b * db) / denom;
+        if t <= 0.0 || t > 1.05 {
+            continue;
+        }
+        // Must lie on the BG->service ray, not merely be tinted by it.
+        if (r - t * dr).abs() < 0.03 && (g - t * dg).abs() < 0.03 && (b - t * db).abs() < 0.03 {
+            brightest = brightest.max(t);
+            if t > 0.3 {
+                present += 1;
+            }
+        }
+    }
+    (brightest, present)
+}
+
+fn https() -> Service {
+    Service::new(Transport::Tcp, Some(443))
+}
+
+fn model_with_service(transport: Transport, port: Option<u16>, at: Instant) -> Model {
+    let mut model = Model::default();
+    model.ingest(
+        &Sample {
+            frame: Frame {
+                src: ip("192.168.1.20"),
+                dst: ip("93.184.216.34"),
+                src_port: Some(51_000),
+                dst_port: port,
+                transport,
+                wire_len: 60,
+            },
+        },
+        &network(),
+        at,
+    );
+    model
+}
+
+#[test]
+fn a_fresh_line_is_drawn_at_full_strength() {
+    let now = Instant::now();
+    let model = model_with_service(Transport::Tcp, Some(443), now);
+    let (brightest, present) = line_signal(&model, now, https());
+    assert!(present > 200, "expected a drawn line, got {present} pixels");
+    // Drawn at 0.85 alpha, so the blend weight should sit just under that.
+    assert!(
+        brightest > 0.7,
+        "fresh line should be near full brightness, got {brightest}"
+    );
+}
+
+#[test]
+fn a_line_dims_continuously_and_is_gone_after_45s() {
+    let t0 = Instant::now();
+    let mut model = model_with_service(Transport::Tcp, Some(443), t0);
+
+    let fresh = line_signal(&model, t0, https()).0;
+
+    // 15s in: still visible, but measurably dimmer. Fading starts immediately,
+    // so there is no hold period.
+    let at15 = t0 + Duration::from_secs(15);
+    let (mid, mid_pixels) = line_signal(&model, at15, https());
+    assert!(
+        mid < fresh - 0.15,
+        "line should dim within 15s: {fresh} -> {mid}"
+    );
+    assert!(mid > 0.3, "line should still be visible at 15s, got {mid}");
+    assert!(mid_pixels > 200, "line should still be drawn at 15s");
+
+    // 40s in: too faint to count as present.
+    let at40 = t0 + Duration::from_secs(40);
+    let (late, late_pixels) = line_signal(&model, at40, https());
+    assert!(late < 0.2, "line should be faint at 40s, got {late}");
+    assert_eq!(late_pixels, 0, "line should no longer be visible at 40s");
+
+    // Past 45s the flow is pruned and the frame is indistinguishable from one
+    // with no traffic at all, even though the circle outlived the line.
+    model.prune(t0 + Duration::from_secs(50));
+    let (gone, gone_pixels) = line_signal(&model, t0 + Duration::from_secs(50), https());
+    let baseline = line_signal(&Model::default(), t0 + Duration::from_secs(50), https()).0;
+    assert_eq!(gone_pixels, 0, "line should have faded out completely");
+    assert!(
+        (gone - baseline).abs() < 0.02,
+        "pruned frame should match an empty one: {gone} vs {baseline}"
+    );
+}
+
+#[test]
+fn a_further_packet_refreshes_the_line_to_full_brightness() {
+    let t0 = Instant::now();
+    let mut model = model_with_service(Transport::Tcp, Some(443), t0);
+
+    let at = t0 + Duration::from_secs(40);
+    let (faded, faded_pixels) = line_signal(&model, at, https());
+    assert!(faded < 0.2, "should be nearly gone after 40s, got {faded}");
+    assert_eq!(
+        faded_pixels, 0,
+        "line should be invisible before the refresh"
+    );
+
+    model.ingest(
+        &Sample {
+            frame: Frame {
+                src: ip("192.168.1.20"),
+                dst: ip("93.184.216.34"),
+                src_port: Some(51_000),
+                dst_port: Some(443),
+                transport: Transport::Tcp,
+                wire_len: 60,
+            },
+        },
+        &network(),
+        at,
+    );
+    let (refreshed, refreshed_pixels) = line_signal(&model, at, https());
+    assert!(
+        refreshed > 0.7,
+        "packet should refresh the line to full brightness, got {refreshed}"
+    );
+    assert!(refreshed_pixels > 200, "refreshed line should be redrawn");
+}
+
+#[test]
+fn parallel_connections_to_one_host_are_all_visible() {
+    // Three services to the same remote share endpoints, so drawing them on top
+    // of each other would hide all but one. They must be fanned apart.
+    let now = Instant::now();
+    let mut model = Model::default();
+    for port in [443u16, 80, 22] {
+        model.ingest(
+            &Sample {
+                frame: Frame {
+                    src: ip("192.168.1.20"),
+                    dst: ip("93.184.216.34"),
+                    src_port: Some(51_000),
+                    dst_port: Some(port),
+                    transport: Transport::Tcp,
+                    wire_len: 60,
+                },
+            },
+            &network(),
+            now,
+        );
+    }
+    assert_eq!(model.flows().count(), 3);
+
+    for port in [443u16, 80, 22] {
+        let service = Service::new(Transport::Tcp, Some(port));
+        let (brightest, present) = line_signal(&model, now, service);
+        assert!(
+            present > 200,
+            "tcp/{port} is hidden behind the other lines ({present} visible pixels)"
+        );
+        assert!(brightest > 0.7, "tcp/{port} line dim: {brightest}");
+    }
+}
+
+#[test]
+fn each_service_is_rendered_in_its_own_colour() {
+    // Each service's line must be found at its own colour and not at another's.
+    let now = Instant::now();
+    for service in [
+        Service::new(Transport::Icmp, None),
+        Service::new(Transport::Udp, Some(53)),
+        Service::new(Transport::Tcp, Some(443)),
+        Service::new(Transport::Tcp, Some(80)),
+    ] {
+        let model = model_with_service(service.transport, service.port, now);
+        let (brightest, present) = line_signal(&model, now, service);
+        assert!(present > 200, "{} line missing", service.label());
+        assert!(brightest > 0.7, "{} line dim", service.label());
+    }
 }
 
 #[test]

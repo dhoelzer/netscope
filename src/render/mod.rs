@@ -12,6 +12,9 @@ use crate::model::{Model, RemoteHost};
 use crate::net::{AddressKind, LocalNetwork, format_address};
 use crate::render::layout::{LAN_LABEL_PITCH, Layout, describe_interface, lan_label};
 use crate::render::text::Font;
+use crate::service::Service;
+use std::collections::BTreeMap;
+use std::net::IpAddr;
 
 type Paint = AlphaColor<Srgb>;
 
@@ -34,6 +37,10 @@ const TITLE_SIZE: f32 = 16.0;
 const LABEL_SIZE: f32 = 14.5;
 const DETAIL_SIZE: f32 = 12.5;
 const HUD_SIZE: f32 = 14.5;
+/// Services listed in the colour key before it reports how many are hidden.
+const LEGEND_ROWS: usize = 8;
+/// Pixels between parallel lines that share a pair of endpoints.
+const LINK_FAN_GAP: f64 = 5.0;
 
 /// Status line shown in the HUD.
 pub struct Hud<'a> {
@@ -111,6 +118,7 @@ impl Scene {
         self.draw_host(&placed);
         self.draw_lan(&placed, network);
         self.draw_remotes(&placed, now);
+        self.draw_legend(model, now);
         self.draw_hud(&placed, hud);
 
         self.ctx.flush();
@@ -120,9 +128,17 @@ impl Scene {
 
     // ---- links -------------------------------------------------------------
 
+    /// One line per connection, coloured by the service it carries. Connections
+    /// that share endpoints are fanned out sideways so each colour stays visible
+    /// instead of being painted over by the next one.
     fn draw_links(&mut self, placed: &Layout, model: &Model, now: std::time::Instant) {
+        // BTreeMap so groups draw in a stable order; within a group the lines are
+        // sorted by service. An unordered fan would reshuffle and flicker on
+        // every frame.
+        let mut groups: BTreeMap<(IpAddr, Option<IpAddr>), LinkGroup> = BTreeMap::new();
+
         for flow in model.flows() {
-            let opacity = Model::opacity(flow.last_seen, now);
+            let opacity = Model::link_opacity(flow.last_seen, now);
             if opacity <= 0.001 {
                 continue;
             }
@@ -132,48 +148,69 @@ impl Scene {
             // The local end is the exact interface square that carried the
             // traffic; a flow reached through the LAN anchors on that circle.
             let anchor = match flow.local {
-                Some(addr) => crate::render::layout::local_anchor(placed, addr, remote.center),
-                None => crate::render::layout::lan_anchor(placed, remote.center),
+                Some(addr) => layout::local_anchor(placed, addr, remote.center),
+                None => layout::lan_anchor(placed, remote.center),
             };
             let Some(anchor) = anchor else { continue };
-            let start = crate::render::layout::rim(remote.center, remote.radius, anchor);
-
-            self.ctx.set_stroke(Stroke {
-                width: link_width(flow.packets),
-                ..Stroke::default()
-            });
-            self.ctx.set_paint(with_alpha(REMOTE, opacity * 0.75));
-            self.ctx.stroke_path(&line_path(start, anchor));
+            let group = groups
+                .entry((flow.remote, flow.local))
+                .or_insert_with(|| LinkGroup {
+                    start: layout::rim(remote.center, remote.radius, anchor),
+                    anchor,
+                    lines: Vec::new(),
+                });
+            group.lines.push((flow.service, flow.packets, opacity));
         }
 
-        // Traffic between this host and the local network: one line between the
-        // host panel and the local-network circle, weighted by all such flows.
-        let (Some(host), Some(lan)) = (placed.host.as_ref(), placed.lan.as_ref()) else {
+        for group in groups.values_mut() {
+            group.lines.sort_by_key(|(service, _, _)| *service);
+            self.stroke_fan(group);
+        }
+
+        // Traffic between this host and the local network: from the host panel to
+        // the local-network circle, one line per connection.
+        let Some(lan) = placed.lan.as_ref() else {
             return;
         };
-        let mut packets = 0u64;
-        let mut last_seen: Option<std::time::Instant> = None;
-        for link in model.lan_links() {
-            packets += link.packets;
-            last_seen = Some(match last_seen {
-                Some(t) => t.max(link.last_seen),
-                None => link.last_seen,
+        let Some(from) = layout::host_anchor(placed, lan.center) else {
+            return;
+        };
+        let Some(to) = layout::lan_anchor(placed, from) else {
+            return;
+        };
+        let mut lines: Vec<(Service, u64, f32)> = model
+            .lan_links()
+            .map(|link| {
+                (
+                    link.service,
+                    link.packets,
+                    Model::link_opacity(link.last_seen, now),
+                )
+            })
+            .filter(|(_, _, opacity)| *opacity > 0.001)
+            .collect();
+        lines.sort_by_key(|(service, _, _)| *service);
+        if !lines.is_empty() {
+            self.stroke_fan(&LinkGroup {
+                start: from,
+                anchor: to,
+                lines,
             });
         }
-        if let Some(last_seen) = last_seen {
-            let opacity = Model::opacity(last_seen, now);
-            if opacity > 0.001 {
-                let from = crate::render::layout::host_anchor(placed, lan.center)
-                    .unwrap_or(crate::render::layout::rect_center(host.rect));
-                if let Some(to) = crate::render::layout::lan_anchor(placed, from) {
-                    self.ctx.set_stroke(Stroke {
-                        width: link_width(packets),
-                        ..Stroke::default()
-                    });
-                    self.ctx.set_paint(with_alpha(LAN_RING, opacity * 0.85));
-                    self.ctx.stroke_path(&line_path(from, to));
-                }
-            }
+    }
+
+    /// Strokes a group of connections sharing one pair of endpoints, fanning them
+    /// sideways so every service colour stays visible.
+    fn stroke_fan(&mut self, group: &LinkGroup) {
+        for (index, (service, packets, opacity)) in group.lines.iter().enumerate() {
+            let (a, b) = fan(group.start, group.anchor, index, group.lines.len());
+            self.ctx.set_stroke(Stroke {
+                width: link_width(*packets),
+                ..Stroke::default()
+            });
+            self.ctx
+                .set_paint(with_alpha(paint(service.rgb()), opacity * 0.85));
+            self.ctx.stroke_path(&line_path(a, b));
         }
     }
 
@@ -370,6 +407,81 @@ impl Scene {
         }
     }
 
+    // ---- service legend ----------------------------------------------------
+
+    /// Colour key for the services currently drawn, so line colours are readable.
+    fn draw_legend(&mut self, model: &Model, now: std::time::Instant) {
+        let mut services: Vec<(Service, f32)> = Vec::new();
+        let mut note = |service: Service, opacity: f32| {
+            if opacity <= 0.001 {
+                return;
+            }
+            match services.iter_mut().find(|(s, _)| *s == service) {
+                Some(entry) => entry.1 = entry.1.max(opacity),
+                None => services.push((service, opacity)),
+            }
+        };
+        for flow in model.flows() {
+            note(flow.service, Model::link_opacity(flow.last_seen, now));
+        }
+        for link in model.lan_links() {
+            note(link.service, Model::link_opacity(link.last_seen, now));
+        }
+        if services.is_empty() {
+            return;
+        }
+        services.sort_by_key(|(service, _)| *service);
+
+        let size = DETAIL_SIZE;
+        let line_h = f64::from(self.font.line_height(size));
+        let swatch = 11.0f64;
+        let x = 16.0f64;
+        let mut y = f64::from(self.height) - 16.0 - f64::from(self.font.descent(size));
+
+        self.ctx.set_paint(DIM);
+        self.font.draw(
+            &mut self.ctx,
+            &mut self.resources,
+            Point { x, y: y - line_h },
+            "traffic colour key",
+            size,
+        );
+
+        for (service, opacity) in services.iter().rev().take(LEGEND_ROWS) {
+            let colour = paint(service.rgb()).with_alpha(*opacity);
+            self.ctx.set_paint(colour);
+            self.ctx.fill_rect(&Rect::new(
+                x,
+                y - f64::from(self.font.ascent(size)) + 2.0,
+                x + swatch,
+                y - f64::from(self.font.ascent(size)) + 2.0 + swatch,
+            ));
+            self.ctx.set_paint(with_alpha(TEXT, *opacity));
+            self.font.draw(
+                &mut self.ctx,
+                &mut self.resources,
+                Point {
+                    x: x + swatch + 8.0,
+                    y,
+                },
+                &service.described(),
+                size,
+            );
+            y -= line_h;
+        }
+        let extra = services.len().saturating_sub(LEGEND_ROWS);
+        if extra > 0 {
+            self.ctx.set_paint(DIM);
+            self.font.draw(
+                &mut self.ctx,
+                &mut self.resources,
+                Point { x, y },
+                &format!("+ {extra} more"),
+                size,
+            );
+        }
+    }
+
     // ---- HUD ---------------------------------------------------------------
 
     fn draw_hud(&mut self, placed: &Layout, hud: &Hud<'_>) {
@@ -433,6 +545,40 @@ fn link_width(packets: u64) -> f64 {
     1.4 + (packets.min(50) as f64 / 50.0) * 2.6
 }
 
+/// A pair of endpoints and the connections drawn between them.
+struct LinkGroup {
+    start: Point,
+    anchor: Point,
+    lines: Vec<(Service, u64, f32)>,
+}
+
+/// Offset for the `index`-th of `count` lines sharing one pair of endpoints,
+/// shifting them sideways so parallel connections stay individually visible.
+fn fan(a: Point, b: Point, index: usize, count: usize) -> (Point, Point) {
+    if count < 2 {
+        return (a, b);
+    }
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1.0 {
+        return (a, b);
+    }
+    // Unit normal to the segment.
+    let (nx, ny) = (-dy / len, dx / len);
+    let step = (index as f64) - (count as f64 - 1.0) / 2.0;
+    let offset = step * LINK_FAN_GAP;
+    (
+        Point {
+            x: a.x + nx * offset,
+            y: a.y + ny * offset,
+        },
+        Point {
+            x: b.x + nx * offset,
+            y: b.y + ny * offset,
+        },
+    )
+}
+
 fn line_path(a: Point, b: Point) -> vello_cpu::kurbo::BezPath {
     Line::new(a, b).to_path(0.1)
 }
@@ -441,11 +587,18 @@ fn with_alpha(color: Paint, alpha: f32) -> Paint {
     color.with_alpha(alpha)
 }
 
+/// Maps a colour-module `[f32; 3]` into Vello's paint type.
+const fn paint(channels: [f32; 3]) -> Paint {
+    rgb(channels[0], channels[1], channels[2])
+}
+
+/// Squares stay deliberately muted: they are chrome, and a saturated fill here
+/// would be mistaken for one of the protocol-coloured traffic lines.
 fn interface_tint(kind: AddressKind) -> Paint {
     match kind {
-        AddressKind::Loopback => rgb(0.62, 0.66, 0.74),
-        AddressKind::LinkLocal => rgb(0.55, 0.80, 0.95),
-        AddressKind::Global => rgb(0.45, 0.90, 0.70),
+        AddressKind::Loopback => rgb(0.30, 0.33, 0.40),
+        AddressKind::LinkLocal => rgb(0.28, 0.40, 0.50),
+        AddressKind::Global => rgb(0.26, 0.44, 0.42),
     }
 }
 

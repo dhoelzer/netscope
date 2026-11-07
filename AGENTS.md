@@ -7,7 +7,7 @@ rendering in a `winit` window via `softbuffer`.
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"   # rustup toolchain, needs Rust >= 1.89
-cargo test                             # 46 tests
+cargo test                             # 66 tests
 cargo clippy --all-targets             # must stay clean
 cargo fmt                              # not --check; CI-less repo, keep formatted
 cargo run --quiet -- --list-devices    # does not need capture permission
@@ -53,3 +53,19 @@ come from `vello_cpu::color::{AlphaColor, Srgb}`).
 * Link anchors go through `local_anchor` / `host_anchor` / `lan_anchor` so the
   line leaves the exact square that carried the traffic. `rect_edge` does the
   ray/rectangle intersection; `rim` does the circle case.
+
+* **Two fade clocks.** Host circles hold for `FADE_SECONDS` (30 s) then fade over
+  `FADE_TAIL_SECONDS`; traffic lines use `Model::link_opacity` and fade
+  immediately over `LINK_FADE_SECONDS` (45 s). `prune()` applies a different
+  horizon to each, so a line can vanish while its circle is still drawn.
+* Flows and LAN links are keyed by **connection**, not host:
+  `FlowKey = (remote, local, Service)`. `service_port()` names the service side
+  (well-known port wins, else the smaller), which keeps both directions of one
+  connection on one line. `MAX_FLOWS` bounds the table; call `enforce_flow_cap()`
+  alongside `enforce_cap()`.
+* `draw_links` groups connections by endpoint pair into a `BTreeMap` and fans
+  parallel lines apart (`fan`, `LINK_FAN_GAP`). Sorting by `Service` is required,
+  not cosmetic — HashMap order is random and an unordered fan flickers per frame.
+* Interface square tints in `interface_tint` stay deliberately muted: a
+  saturated fill there collides with protocol line colours and makes a line read
+  as missing.

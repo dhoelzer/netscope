@@ -38,12 +38,21 @@ on all three platforms down to one native library.
 * **Remote circles (left columns)** — one per unique host seen that is neither a
   local address nor on the local network. A circle stays on screen and fades out
   starting 30 s of real time after the last packet to or from that address.
-* **Links** — a line from a remote circle to the *exact square* of the interface
-  that carried the traffic, or out to the local-network circle when the remote
-  reached another system on the LAN. Traffic between this host and the local
-  network draws a line between the host panel and the local-network circle.
-  LAN↔LAN traffic feeds the local-network circle; it never creates a remote
-  circle.
+* **Links** — one line per *connection*, from a remote circle to the *exact
+  square* of the interface that carried the traffic, or out to the local-network
+  circle when the remote reached another system on the LAN. Traffic between this
+  host and the local network draws lines between the host panel and the
+  local-network circle. LAN↔LAN traffic feeds the local-network circle; it never
+  creates a remote circle.
+* **Line colour** — set by protocol and port: `tcp/443`, `udp/53`, `icmp` and
+  other well-known services have fixed colours, and anything else gets a stable
+  colour derived from its protocol and port. A remote contacted over three
+  services shows three coloured lines, fanned apart so all three stay visible.
+  A colour key for the services currently on screen sits in the lower left.
+* **Line fading** — unlike a host circle, a line starts fading the moment it is
+  drawn and is gone after 45 s. Any further packet on that connection snaps it
+  back to full brightness. Lines therefore disappear well before the circles
+  they attach to.
 
 When there are more remote hosts than fit in one column, the grid wraps into
 extra columns and tightens its spacing; anything that still cannot be drawn is
@@ -184,7 +193,8 @@ cargo run --release --example capture-probe -- eth0 5
 | `src/capture/parse.rs` | link-layer → IPv4/IPv6 → TCP/UDP decoding, incl. VLAN tags, IPv4 options, IPv6 extension headers |
 | `src/capture/mod.rs` | capture thread: live device or savefile replay, stats, backpressure |
 | `src/net.rs` | local interface/address discovery, subnet derivation, `Host` / `LocalNetwork` / `Remote` classification |
-| `src/model.rs` | remote + LAN host tables, 30 s fade clock, flow anchoring, pruning, host cap |
+| `src/model.rs` | remote + LAN host tables, per-connection flow table, two fade clocks (30 s circles / 45 s lines), pruning, caps |
+| `src/service.rs` | the service a line carries (protocol + port) and the colour it is drawn in |
 | `src/render/layout.rs` | pure geometry: panel, squares, LAN circle, link endpoints |
 | `src/render/text.rs` | skrifa font metrics + label fitting (glifo draws the glyphs) |
 | `src/render/mod.rs` | Vello CPU scene: host panel, squares, LAN circle, links, HUD |
@@ -211,7 +221,7 @@ encoder would produce, and is git-ignored rather than committed.
 ## Tests
 
 ```sh
-cargo test          # 46 tests: parsing, classification, fade timing, layout, render, end-to-end replay
+cargo test          # 66 tests: parsing, classification, fade timing, colours, layout, render, end-to-end replay
 cargo clippy --all-targets
 ```
 
