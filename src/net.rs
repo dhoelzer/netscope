@@ -43,6 +43,18 @@ pub struct Subnet {
 }
 
 impl Subnet {
+    /// The IPv4 directed broadcast address for this subnet, e.g. 192.168.1.255
+    /// for 192.168.1.0/24. `None` for IPv6, which has no broadcast address.
+    #[must_use]
+    pub fn broadcast(&self) -> Option<Ipv4Addr> {
+        if self.is_v6 || self.prefix == 0 {
+            return None;
+        }
+        let host_bits = 32 - u32::from(self.prefix);
+        let last = (self.network & 0xffff_ffff) | ((1u128 << host_bits) - 1);
+        Some(Ipv4Addr::from(last as u32))
+    }
+
     pub fn contains(&self, addr: IpAddr) -> bool {
         let (bits, is_v6) = to_bits(addr);
         if is_v6 != self.is_v6 || self.prefix >= width_bits(self.is_v6) {
@@ -59,6 +71,10 @@ pub enum Location {
     Host,
     /// Another system on one of this host's networks.
     LocalNetwork,
+    /// A broadcast or multicast group: not a single system, and not one hop
+    /// away in the way a unicast peer is, so it is grouped with the local
+    /// network rather than placed on the hop ruler.
+    LocalGroup,
     /// Everything else.
     Remote,
 }
@@ -188,12 +204,46 @@ impl LocalNetwork {
 
     #[must_use]
     pub fn classify(&self, addr: IpAddr) -> Location {
+        // Group before subnet: a subnet's own directed broadcast (192.168.1.255
+        // for a /24) falls inside that subnet, but it names no single system, so
+        // treating it as an ordinary peer would be wrong.
         if self.is_host_address(addr) {
             Location::Host
+        } else if self.is_local_group(addr) {
+            Location::LocalGroup
         } else if self.is_local_network(addr) {
             Location::LocalNetwork
         } else {
             Location::Remote
+        }
+    }
+
+    /// Whether an address is a group address that only this host's own networks
+    /// could have delivered: the limited broadcast, the directed broadcast of
+    /// one of our subnets, IPv4 multicast, or IPv6 multicast scoped to our link
+    /// or site.
+    ///
+    /// A group address is never a single system, so its TTL says nothing about
+    /// how far away the sender is; that is why these are kept off the hop ruler.
+    #[must_use]
+    pub fn is_local_group(&self, addr: IpAddr) -> bool {
+        match addr {
+            IpAddr::V4(v4) => {
+                v4.is_broadcast()
+                    || v4.is_multicast()
+                    || self
+                        .subnets
+                        .iter()
+                        .any(|s| !s.is_v6 && s.broadcast() == Some(v4))
+            }
+            IpAddr::V6(v6) => {
+                // A multicast address is ff | flags<<4 | scope in its first two
+                // bytes. Only link-local (scope 2) and site-local (scope 5)
+                // groups can reach us from our own networks; a realm-scoped
+                // group is genuinely remote.
+                let first = v6.segments()[0];
+                first & 0xfff0 == 0xff00 && matches!(first & 0x000f, 0x0002 | 0x0005)
+            }
         }
     }
 

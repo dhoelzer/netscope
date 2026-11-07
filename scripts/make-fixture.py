@@ -17,7 +17,9 @@ to get right:
  10. inbound TTLs of 58, 251 and 60      (hop counts 6, 4 and 4)
  11. a remote seen only outbound         (no TTL reading: left edge)
  12. an inbound TTL implying 44 hops     (beyond the ceiling: left edge)
- 10. a truncated frame                   (must be skipped, not panic)
+ 13. broadcast and multicast traffic     (parked beside the local network,
+     whatever their TTL says)
+ 14. a truncated frame                   (must be skipped, not panic)
 
 Run from the repository root:
 
@@ -94,6 +96,12 @@ def build() -> bytes:
     remote_edge = "198.51.100.7"
     remote_far = "192.0.2.99"
     bridge = "10.20.0.5"
+    # Group addresses: the limited broadcast, this /24's directed broadcast, and
+    # IPv4 multicast. Each would land on the far left on TTL alone, which is
+    # wrong -- they are local traffic, not distant hosts.
+    limited_bcast = "255.255.255.255"
+    subnet_bcast = "192.168.1.255"
+    multicast = "224.0.0.251"
 
     host_mac, router_mac = "aabbccddeeff", "112233445566"
 
@@ -122,6 +130,26 @@ def build() -> bytes:
         ),
         ethernet(host_mac, router_mac, 0x0800, ipv4(lan_peer_a, lan_peer_b, 6, tcp(9000, 22))),
         ethernet(router_mac, host_mac, 0x0800, ipv4(lan_peer_a, host, 6, tcp(4514, 22))),
+        # Group traffic, deliberately arriving with TTLs that would otherwise
+        # place these on distant guide lines.
+        ethernet(
+            host_mac,
+            "ffffffffffff",
+            0x0800,
+            ipv4(host, limited_bcast, 17, udp(68, 67), ttl=64),
+        ),
+        ethernet(
+            router_mac,
+            "ffffffffffff",
+            0x0800,
+            ipv4(lan_peer_a, subnet_bcast, 17, udp(5353, 5353), ttl=64),
+        ),
+        ethernet(
+            router_mac,
+            "01005e0000fb",
+            0x0800,
+            ipv4(lan_peer_b, multicast, 17, udp(5353, 5353), ttl=250),
+        ),
         ethernet(host_mac, "ffffffffffff", 0x0806, b"\x00" * 28),
         ethernet(
             host_mac, router_mac, 0x86DD, ipv6(v6_global(1), v6_global(2), 6, tcp(4000, 80))

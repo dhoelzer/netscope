@@ -80,6 +80,10 @@ pub struct RemoteHost {
     /// `None` when the first packet already revealed it, so the host is placed
     /// on its line at once with nothing to animate.
     pub hops_learned_at: Option<Instant>,
+    /// A broadcast or multicast group rather than a single system. Its TTL is
+    /// meaningless as a distance, so it is placed beside the local network
+    /// instead of on the hop ruler.
+    pub group: bool,
 }
 
 /// A LAN peer that has been seen talking to us or to another LAN peer.
@@ -105,6 +109,12 @@ pub struct Flow {
     pub local: Option<IpAddr>,
     pub last_seen: Instant,
     pub packets: u64,
+    /// Traffic counted by direction, keyed on the `remote` endpoint so the
+    /// totals stay meaningful even when no interface of ours is involved.
+    pub to_remote_packets: u64,
+    pub to_remote_bytes: u64,
+    pub from_remote_packets: u64,
+    pub from_remote_bytes: u64,
     /// The connection this line represents: protocol plus service port. It
     /// decides the line's colour and keeps the two directions of one
     /// connection on a single line.
@@ -119,6 +129,10 @@ pub struct LanLink {
     pub local: IpAddr,
     pub last_seen: Instant,
     pub packets: u64,
+    pub to_peer_packets: u64,
+    pub to_peer_bytes: u64,
+    pub from_peer_packets: u64,
+    pub from_peer_bytes: u64,
     pub service: Service,
 }
 
@@ -165,7 +179,10 @@ impl Model {
             (frame.dst, dst, frame.src, src),
         ] {
             match location {
-                Location::Remote => {
+                // Remote hosts and broadcast/multicast groups both get a circle
+                // and a link; `note_remote` tells them apart. See
+                // `LocalNetwork::is_local_group`.
+                Location::Remote | Location::LocalGroup => {
                     self.note_remote(addr, peer_location, Some(peer), network, now, &frame);
                 }
                 Location::LocalNetwork => {
@@ -191,6 +208,7 @@ impl Model {
         now: Instant,
         frame: &Frame,
     ) {
+        let group = network.is_local_group(remote);
         let host = self.remotes.entry(remote).or_insert_with(|| RemoteHost {
             addr: remote,
             last_seen: now,
@@ -201,6 +219,7 @@ impl Model {
             last_transport: frame.transport,
             hops: None,
             hops_learned_at: None,
+            group,
         });
         // A host created by this very frame has not been on screen at the edge,
         // so a distance read from the same frame needs no animation.
@@ -211,7 +230,7 @@ impl Model {
         host.last_transport = frame.transport;
         // Only a packet arriving *from* the remote carries a TTL that says
         // something about distance; one we sent carries a TTL we chose.
-        let learned = (frame.src == remote)
+        let learned = (!group && frame.src == remote)
             .then(|| infer_hops(frame.ttl))
             .flatten()
             .filter(|h| Some(*h) != host.hops);
@@ -237,8 +256,9 @@ impl Model {
                 }
                 None
             }
-            // remote <-> remote with no local side: anchor on the LAN circle.
-            Location::Remote => None,
+            // A group on the far side: anchor on the LAN circle too, so the
+            // link leaves the local-network side rather than an interface.
+            Location::LocalGroup | Location::Remote => None,
         };
 
         let service = Service::new(frame.transport, service_port(frame));
@@ -250,10 +270,22 @@ impl Model {
                 local,
                 last_seen: now,
                 packets: 0,
+                to_remote_packets: 0,
+                to_remote_bytes: 0,
+                from_remote_packets: 0,
+                from_remote_bytes: 0,
                 service,
             });
         flow.last_seen = now;
         flow.packets += 1;
+        let bytes = u64::from(frame.wire_len);
+        if frame.dst == remote {
+            flow.to_remote_packets += 1;
+            flow.to_remote_bytes += bytes;
+        } else {
+            flow.from_remote_packets += 1;
+            flow.from_remote_bytes += bytes;
+        }
     }
 
     fn note_lan_link(&mut self, peer: IpAddr, local: IpAddr, now: Instant, frame: &Frame) {
@@ -266,10 +298,22 @@ impl Model {
                 local,
                 last_seen: now,
                 packets: 0,
+                to_peer_packets: 0,
+                to_peer_bytes: 0,
+                from_peer_packets: 0,
+                from_peer_bytes: 0,
                 service,
             });
         link.last_seen = now;
         link.packets += 1;
+        let bytes = u64::from(frame.wire_len);
+        if frame.dst == peer {
+            link.to_peer_packets += 1;
+            link.to_peer_bytes += bytes;
+        } else {
+            link.from_peer_packets += 1;
+            link.from_peer_bytes += bytes;
+        }
     }
 
     fn note_lan(&mut self, addr: IpAddr, now: Instant, frame: &Frame) {
@@ -392,5 +436,11 @@ impl Model {
             .chain(self.lan.values().map(|h| h.last_seen))
             .map(|t| now.duration_since(t).as_secs_f64())
             .fold(f64::INFINITY, f64::min)
+    }
+
+    /// The circle standing for one remote address, if it is being tracked.
+    #[must_use]
+    pub fn remote(&self, addr: IpAddr) -> Option<&RemoteHost> {
+        self.remotes.get(&addr)
     }
 }

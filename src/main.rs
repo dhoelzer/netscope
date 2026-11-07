@@ -18,7 +18,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-const DEFAULT_WIDTH: u16 = 1280;
+/// Wide enough that 20 hop guide lines still leave room for an address label
+/// under each circle, and a lane beside the local-network circle for group
+/// traffic.
+const DEFAULT_WIDTH: u16 = 1920;
 const DEFAULT_HEIGHT: u16 = 800;
 /// Frames per second while animating fades.
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);

@@ -46,6 +46,16 @@ fn remote_hops(
     packets: u64,
     hops: Option<u32>,
 ) -> netscope::model::RemoteHost {
+    remote_group(addr, last_seen, packets, hops, false)
+}
+
+fn remote_group(
+    addr: &str,
+    last_seen: Instant,
+    packets: u64,
+    hops: Option<u32>,
+    group: bool,
+) -> netscope::model::RemoteHost {
     netscope::model::RemoteHost {
         addr: ip(addr),
         last_seen,
@@ -56,6 +66,7 @@ fn remote_hops(
         last_transport: Transport::Tcp,
         hops,
         hops_learned_at: None,
+        group,
     }
 }
 
@@ -710,7 +721,7 @@ fn off_background(px: &(u8, u8, u8)) -> bool {
 }
 
 #[test]
-fn all_fifteen_guide_lines_are_drawn_where_the_layout_says() {
+fn all_twenty_guide_lines_are_drawn_where_the_layout_says() {
     let now = Instant::now();
     let mut scene = Scene::new(1280, 800);
     scene.draw(&network(), &Model::default(), &empty_hud(), now);
@@ -718,7 +729,8 @@ fn all_fifteen_guide_lines_are_drawn_where_the_layout_says() {
     let data = scene.pixmap().data();
     let width = 1280usize;
     let positions = layout::hop_line_positions(1280.0);
-    assert_eq!(positions.len(), 15);
+    assert_eq!(positions.len(), layout::HOP_LINES);
+    assert_eq!(layout::HOP_LINES, 20);
 
     for (i, x) in positions.iter().enumerate() {
         let col = (*x as usize).clamp(1, width - 2);
@@ -955,4 +967,68 @@ fn hop_labels_stay_separate_at_every_window_width() {
             );
         }
     }
+}
+
+#[test]
+fn group_hosts_are_parked_between_the_first_line_and_the_lan_circle() {
+    let now = Instant::now();
+    let remotes = vec![
+        // A group whose TTL would have put it on line 4 if the ruler applied.
+        remote_group("224.0.0.251", now, 5, Some(4), true),
+        remote_group("255.255.255.255", now, 3, None, true),
+        // A unicast host at 4 hops, for contrast.
+        remote_hops("203.0.113.40", now, 2, Some(4)),
+    ];
+    let placed = layout::build(1920.0, 800.0, &network(), &remotes, &[], now);
+
+    let line_one = placed.hop_lines[0].x;
+    let lan = placed.lan.as_ref().expect("lan circle");
+    let rim = lan.center.x - lan.radius;
+    assert!(
+        rim > line_one,
+        "the layout should leave a lane between the 1-hop line ({line_one}) and the circle rim ({rim})"
+    );
+
+    for addr in ["224.0.0.251", "255.255.255.255"] {
+        let host = placed
+            .remotes
+            .iter()
+            .find(|r| r.host.addr == ip(addr))
+            .unwrap_or_else(|| panic!("{addr} should be placed"));
+        assert!(
+            host.center.x > line_one && host.center.x < rim,
+            "{addr} should sit in the near lane ({line_one}..{rim}), got {}",
+            host.center.x
+        );
+        assert_eq!(host.slot, None, "a group sits on no guide line");
+    }
+
+    // The unicast host is unaffected and still sits on its 4-hop line.
+    let unicast = placed
+        .remotes
+        .iter()
+        .find(|r| r.host.addr == ip("203.0.113.40"))
+        .expect("unicast host");
+    assert_eq!(unicast.slot, Some(3));
+    assert!((unicast.center.x - placed.hop_lines[3].x).abs() < 0.01);
+}
+
+#[test]
+fn the_lan_circle_shrinks_to_keep_the_near_lane_open() {
+    // A wide window gives the circle room to grow, but it must stop short of the
+    // 1-hop line so the group lane stays usable.
+    let placed = layout::build(1920.0, 800.0, &network(), &[], &[], t0());
+    let lan = placed.lan.as_ref().expect("lan circle");
+    let rim = lan.center.x - lan.radius;
+    let line_one = placed.hop_lines[0].x;
+    assert!(
+        rim >= line_one + layout::LAN_LANE_RESERVE - 1.0,
+        "rim {rim} should leave {}px of lane right of line 1 at {line_one}",
+        layout::LAN_LANE_RESERVE
+    );
+    assert!(
+        placed.near_x > line_one && placed.near_x < rim,
+        "the lane centre {} should sit between {line_one} and {rim}",
+        placed.near_x
+    );
 }

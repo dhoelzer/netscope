@@ -111,7 +111,7 @@ impl Scene {
     }
 
     /// Renders one frame and returns the layout that was drawn, so callers can
-    /// hit-test or log it.
+    /// log it or hit-test against it.
     pub fn draw(
         &mut self,
         network: &LocalNetwork,
@@ -146,6 +146,7 @@ impl Scene {
     /// One line per connection, coloured by the service it carries. Connections
     /// that share endpoints are fanned out sideways so each colour stays visible
     /// instead of being painted over by the next one.
+    ///
     fn draw_links(&mut self, placed: &Layout, model: &Model, now: std::time::Instant) {
         // BTreeMap so groups draw in a stable order; within a group the lines are
         // sorted by service. An unordered fan would reshuffle and flicker on
@@ -369,11 +370,11 @@ impl Scene {
 
     // ---- remote hosts ------------------------------------------------------
 
-    /// The hop ruler: 15 evenly spaced dashed vertical lines with a hop count
+    /// The hop ruler: 20 evenly spaced dashed vertical lines with a hop count
     /// labelled at the top of each.
     ///
-    /// `vello_cpu` accepts a dash pattern in its stroke but never reads it, so
-    /// the dashes are emitted as explicit segments.
+    /// The dashes come from kurbo's `Stroke::dash_pattern`, which `vello_cpu`
+    /// honours when it flattens the stroke.
     fn draw_hop_lines(&mut self, placed: &Layout, height: f64) {
         let Some(first) = placed.hop_lines.first() else {
             return;
@@ -455,11 +456,11 @@ impl Scene {
             self.ctx
                 .stroke_path(&Circle::new(center, remote.radius).to_path(0.1));
 
-            // Labels go under the circle: with 15 guide lines sharing the
+            // Labels go under the circle: with 20 guide lines sharing the
             // window there is no horizontal room beside it.
-            let size = self.remote_label_size(placed);
+            let size = self.remote_label_size(remote.label_budget);
             let label = format_address(remote.host.addr);
-            let label = self.font.fit(&label, size, placed.label_budget as f32);
+            let label = self.font.fit(&label, size, remote.label_budget as f32);
             let w = f64::from(self.font.measure(&label, size));
             self.ctx.set_paint(with_alpha(TEXT, opacity));
             self.font.draw(
@@ -478,11 +479,15 @@ impl Scene {
                     "{} · {} · {}",
                     transport_tag(remote.host.last_transport),
                     remote.host.packets,
-                    hop_tag(remote.host.hops),
+                    if remote.host.group {
+                        "local group".to_string()
+                    } else {
+                        hop_tag(remote.host.hops)
+                    },
                 );
                 let detail = self
                     .font
-                    .fit(&detail, DETAIL_SIZE, placed.label_budget as f32);
+                    .fit(&detail, DETAIL_SIZE, remote.label_budget as f32);
                 let w = f64::from(self.font.measure(&detail, DETAIL_SIZE));
                 self.ctx.set_paint(with_alpha(DIM, opacity));
                 self.font.draw(
@@ -503,15 +508,15 @@ impl Scene {
         }
     }
 
-    /// Font size for a remote address, shrunk when the guide-line pitch is
-    /// narrow enough that a full IPv4 address would collide.
-    fn remote_label_size(&self, placed: &Layout) -> f32 {
+    /// Font size for a remote address, shrunk when the room the label has is
+    /// narrow enough that a full IPv4 address would collide with its neighbours.
+    fn remote_label_size(&self, label_budget: f64) -> f32 {
         let widest = f64::from(self.font.measure("255.255.255.255", LABEL_SIZE));
-        if widest <= placed.label_budget {
+        if widest <= label_budget {
             return LABEL_SIZE;
         }
         // Glyph width is proportional to size, so solve for the size that fits.
-        (LABEL_SIZE * (placed.label_budget / widest) as f32).max(MIN_LABEL_SIZE)
+        (LABEL_SIZE * (label_budget / widest) as f32).max(MIN_LABEL_SIZE)
     }
 
     // ---- service legend ----------------------------------------------------

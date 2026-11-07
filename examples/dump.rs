@@ -11,19 +11,30 @@ use netscope::render::{Hud, Scene};
 use pcap::Capture;
 use std::time::Instant;
 
+const DEFAULT_WIDTH: u16 = 1920;
+const DEFAULT_HEIGHT: u16 = 800;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let out = args
         .next()
-        .ok_or("usage: dump OUT.png IN.pcap [--local SPECS..]")?;
+        .ok_or("usage: dump OUT.png IN.pcap [--local SPECS..] [--size W H]")?;
     let input = args.next().ok_or("missing pcap path")?;
     let mut local = Vec::new();
-    if args.next().as_deref() == Some("--local") {
-        for v in args {
-            if v.starts_with("--") {
-                break;
-            }
-            local.push(v);
+    let mut width = DEFAULT_WIDTH;
+    let mut height = DEFAULT_HEIGHT;
+    let mut rest: Vec<String> = args.collect();
+    if let Some(index) = rest.iter().position(|v| v == "--local") {
+        rest.remove(index);
+        while rest.first().is_some_and(|v| !v.starts_with("--")) {
+            local.push(rest.remove(0));
+        }
+    }
+    if let Some(index) = rest.iter().position(|v| v == "--size") {
+        rest.remove(index);
+        if rest.len() >= 2 {
+            width = rest.remove(0).parse::<u16>().unwrap_or(DEFAULT_WIDTH);
+            height = rest.remove(0).parse::<u16>().unwrap_or(DEFAULT_HEIGHT);
         }
     }
 
@@ -43,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut scene = Scene::new(1280, 800);
+    let mut scene = Scene::new(width, height);
     let hud = Hud {
         source: &input,
         frames_seen: model.frames_seen,
@@ -65,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .flat_map(|p| [p.r, p.g, p.b, p.a])
         .collect();
-    std::fs::write(&out, encode_png(1280, 800, &rgba))?;
+    std::fs::write(&out, encode_png(u32::from(width), u32::from(height), &rgba))?;
     println!("wrote {out} ({} remote hosts)", model.remote_count());
     Ok(())
 }

@@ -5,6 +5,10 @@ use netscope::net::{
 };
 use std::net::IpAddr;
 
+fn ip(s: &str) -> IpAddr {
+    s.parse().unwrap()
+}
+
 fn v4(ip: &str, prefix: u8, iface: &str) -> LocalAddress {
     LocalAddress {
         iface: iface.to_string(),
@@ -138,4 +142,47 @@ fn discovery_on_a_real_host_finds_something_or_is_empty() {
         assert!(subnet.prefix > 0);
         assert!(!net.subnets().is_empty());
     }
+}
+
+#[test]
+fn broadcast_and_multicast_are_local_groups_not_distant_hosts() {
+    let net = LocalNetwork::from_addresses(vec![v4("192.168.1.20", 24, "eth0")]);
+
+    // The limited broadcast and this subnet's own directed broadcast.
+    assert_eq!(net.classify(ip("255.255.255.255")), Location::LocalGroup);
+    assert_eq!(net.classify(ip("192.168.1.255")), Location::LocalGroup);
+    // IPv4 multicast as a class.
+    assert_eq!(net.classify(ip("224.0.0.251")), Location::LocalGroup);
+    assert_eq!(net.classify(ip("239.1.2.3")), Location::LocalGroup);
+    // IPv6 multicast scoped to our link or site.
+    assert_eq!(net.classify(ip("ff02::fb")), Location::LocalGroup);
+    assert_eq!(net.classify(ip("ff05::2")), Location::LocalGroup);
+    // A realm-scoped IPv6 group is genuinely remote.
+    assert_eq!(net.classify(ip("fffe::1")), Location::Remote);
+
+    // The broadcast of some other subnet is not ours, and neither is an
+    // ordinary address inside our subnet.
+    assert_eq!(net.classify(ip("10.20.255.255")), Location::Remote);
+    assert_eq!(net.classify(ip("192.168.1.7")), Location::LocalNetwork);
+
+    // Our own address still wins over any group reading.
+    assert_eq!(net.classify(ip("192.168.1.20")), Location::Host);
+}
+
+#[test]
+fn subnet_broadcast_address_is_computed_from_the_prefix() {
+    let net = LocalNetwork::from_addresses(vec![
+        v4("192.168.1.20", 24, "eth0"),
+        v4("10.20.0.5", 16, "br0"),
+        v4("172.16.5.9", 30, "tun0"),
+    ]);
+    let broadcasts: Vec<String> = net
+        .subnets()
+        .iter()
+        .map(|s| s.broadcast().map(|b| b.to_string()))
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
+    assert!(broadcasts.contains(&"192.168.1.255".to_string()));
+    assert!(broadcasts.contains(&"10.20.255.255".to_string()));
+    assert!(broadcasts.contains(&"172.16.5.11".to_string()));
 }

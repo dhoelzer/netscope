@@ -35,6 +35,13 @@ fn frame_ttl(src: &str, dst: &str, proto: u8, ttl: u8) -> Sample {
     Sample { frame: f }
 }
 
+/// Frame wrapped as a sample, for the direction-counter tests.
+fn sample(src: &str, dst: &str, proto: u8) -> Sample {
+    Sample {
+        frame: frame(src, dst, proto),
+    }
+}
+
 const HOST_A: &str = "192.168.1.20";
 
 fn frame(src: &str, dst: &str, proto: u8) -> Frame {
@@ -624,4 +631,84 @@ fn a_reply_reveals_the_distance_and_starts_the_slide() {
         .unwrap();
     assert_eq!(host.hops, Some(5));
     assert_eq!(host.hops_learned_at, Some(later));
+}
+
+#[test]
+fn group_traffic_is_flagged_and_gets_no_hop_distance() {
+    let network = net();
+    let mut model = Model::default();
+    let t0 = Instant::now();
+
+    // A multicast group reached from a LAN peer. TTL 1 would read as "one hop
+    // away", which is meaningless for a group address.
+    model.ingest(
+        &frame_ttl("192.168.1.7", "224.0.0.251", 17, 1),
+        &network,
+        t0,
+    );
+    // The limited broadcast, and our subnet's own directed broadcast.
+    model.ingest(&frame_ttl(HOST_A, "255.255.255.255", 17, 64), &network, t0);
+    model.ingest(&frame_ttl(HOST_A, "192.168.1.255", 17, 64), &network, t0);
+
+    for addr in ["224.0.0.251", "255.255.255.255", "192.168.1.255"] {
+        let host = model
+            .remote(ip(addr))
+            .unwrap_or_else(|| panic!("{addr} should be tracked"));
+        assert!(host.group, "{addr} should be flagged as a group");
+        assert_eq!(host.hops, None, "{addr} should have no hop distance");
+    }
+
+    // A unicast remote is unaffected.
+    model.ingest(&frame_ttl("203.0.113.9", HOST_A, 6, 58), &network, t0);
+    let unicast = model.remote(ip("203.0.113.9")).expect("unicast remote");
+    assert!(!unicast.group);
+    assert_eq!(unicast.hops, Some(6));
+}
+
+#[test]
+fn flow_counters_split_traffic_by_direction() {
+    let network = net();
+    let mut model = Model::default();
+    let t0 = Instant::now();
+
+    // Outbound: us -> remote on tcp/443.
+    model.ingest(&sample(HOST_A, "203.0.113.9", 6), &network, t0);
+    model.ingest(&sample(HOST_A, "203.0.113.9", 6), &network, t0);
+    // Inbound: remote -> us on the same service.
+    model.ingest(&sample("203.0.113.9", HOST_A, 6), &network, t0);
+
+    let flows: Vec<_> = model
+        .flows()
+        .filter(|f| f.remote == ip("203.0.113.9"))
+        .collect();
+    assert_eq!(flows.len(), 1, "both directions share one connection");
+    let flow = flows[0];
+    assert_eq!(flow.packets, 3);
+    assert_eq!(flow.to_remote_packets, 2);
+    assert_eq!(flow.to_remote_bytes, 120);
+    assert_eq!(flow.from_remote_packets, 1);
+    assert_eq!(flow.from_remote_bytes, 60);
+}
+
+#[test]
+fn lan_link_counters_split_traffic_by_direction() {
+    let network = net();
+    let mut model = Model::default();
+    let t0 = Instant::now();
+
+    model.ingest(&sample(HOST_A, "192.168.1.7", 17), &network, t0);
+    model.ingest(&sample("192.168.1.7", HOST_A, 17), &network, t0);
+    model.ingest(&sample("192.168.1.7", HOST_A, 17), &network, t0);
+
+    let links: Vec<_> = model
+        .lan_links()
+        .filter(|l| l.peer == ip("192.168.1.7"))
+        .collect();
+    assert_eq!(links.len(), 1, "both directions share one link");
+    let link = links[0];
+    assert_eq!(link.packets, 3);
+    assert_eq!(link.to_peer_packets, 1);
+    assert_eq!(link.to_peer_bytes, 60);
+    assert_eq!(link.from_peer_packets, 2);
+    assert_eq!(link.from_peer_bytes, 120);
 }

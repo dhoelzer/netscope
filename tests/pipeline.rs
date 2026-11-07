@@ -44,13 +44,14 @@ fn fixture_classifies_host_lan_and_remote_correctly() {
 
     let mut model = Model::default();
     let (seen, decoded) = replay(&network, &mut model);
-    assert_eq!(seen, 14, "fixture has 14 packets");
-    // ARP and the truncated frame are not IP, so 12 decode.
-    assert_eq!(decoded, 12);
+    assert_eq!(seen, 17, "fixture has 17 packets");
+    // ARP and the truncated frame are not IP, so 15 decode.
+    assert_eq!(decoded, 15);
 
     // Only 192.168.1.0/24 is declared local here, so the fixture's second
     // interface address 10.20.0.5 counts as a remote endpoint.
-    assert_eq!(model.remote_count(), 8);
+    // The three group addresses count as remotes too, but flagged as groups.
+    assert_eq!(model.remote_count(), 11);
     assert_eq!(model.lan_count(), 2);
 
     let remote_addrs: Vec<String> = model.remotes().map(|h| h.addr.to_string()).collect();
@@ -69,6 +70,21 @@ fn fixture_classifies_host_lan_and_remote_correctly() {
             "missing {expected}"
         );
     }
+    // Broadcast and multicast are tracked as remotes but flagged, so the layout
+    // can keep them off the hop ruler.
+    let groups: Vec<String> = model
+        .remotes()
+        .filter(|h| h.group)
+        .map(|h| h.addr.to_string())
+        .collect();
+    for expected in ["255.255.255.255", "192.168.1.255", "224.0.0.251"] {
+        assert!(
+            groups.contains(&expected.to_string()),
+            "missing group {expected}"
+        );
+    }
+    assert_eq!(groups.len(), 3);
+
     let lan_addrs: Vec<String> = model.lan().map(|h| h.addr.to_string()).collect();
     assert!(lan_addrs.contains(&"192.168.1.7".to_string()));
     assert!(lan_addrs.contains(&"192.168.1.9".to_string()));
@@ -149,10 +165,30 @@ fn fixture_replay_renders_without_panicking() {
     };
     let placed = scene.draw(&network, &model, &hud, Instant::now());
 
-    // Every remote in the model should have been placed on the left half.
+    // Every remote in the model should have been placed.
     assert_eq!(placed.remotes.len(), model.remote_count());
     let host = placed.host.as_ref().expect("host panel");
-    assert!(placed.remotes.iter().all(|r| r.center.x < host.rect.x0));
+    // Unicast remotes stay left of the host panel; group traffic is parked in
+    // the lane beside the local-network circle, which is on the right.
+    assert!(
+        placed
+            .remotes
+            .iter()
+            .filter(|r| !r.host.group)
+            .all(|r| r.center.x < host.rect.x0),
+        "unicast remotes belong left of the host panel"
+    );
+    let line_one = placed.hop_lines[0].x;
+    let lan = placed.lan.as_ref().expect("lan circle");
+    let rim = lan.center.x - lan.radius;
+    for group in placed.remotes.iter().filter(|r| r.host.group) {
+        assert!(
+            group.center.x > line_one && group.center.x < rim,
+            "group {} should sit between the 1-hop line ({line_one}) and the local-network rim ({rim}), got {}",
+            group.host.addr,
+            group.center.x
+        );
+    }
 }
 
 #[test]

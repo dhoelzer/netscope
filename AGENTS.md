@@ -77,11 +77,17 @@ come from `vello_cpu::color::{AlphaColor, Srgb}`).
   the TTL *we* transmit is our own default and says nothing about the return
   path, so outbound-only hosts have no inferred distance and park at the far left.
 * Common OS defaults are 64 (Linux/macOS), 63, 128 (Windows) and 255 (network
-  gear). Distance is `default - ttl`, so a TTL of 64 means 1 hop; `MAX_HOPS` (15)
-  is the ceiling, and a TTL implying more is clamped rather than dropped.
-* `layout::hop_line_positions` owns the 15 guide lines: the first sits 25% of the
-  width in from the right, the rest are evenly spaced to the left margin. Render
-  and tests both read it from there — never recompute the pitch in two places.
+  gear). Distance is `default - ttl`, so a TTL of 64 means 1 hop; `MAX_HOPS` (32)
+  is the ceiling, and a TTL implying more yields `None` rather than a wrong number.
+* `layout::hop_line_positions` owns the `HOP_LINES` (20) guide lines: the first
+  sits 25% of the width in from the right, the rest are evenly spaced to the left
+  margin. Render and tests both read it from there — never recompute the pitch in
+  two places. `Layout::hop_lines` is the placed copy of the same positions.
+* Broadcast and multicast (`Location::LocalGroup`) are **not** placed on the
+  ruler: a group address is not one system, so its TTL says nothing about
+  distance. They sit in the lane between the 1-hop line and the local-network
+  circle (`Layout::near_x`, sized by `LAN_LANE_RESERVE`, which shrinks the circle
+  to keep the lane open). `Model::group` marks them and suppresses hop inference.
 * Dashes come from kurbo (`Stroke { dash_pattern, .. }`), not vello — see
   `docs/reference/vello.md`. Set `Cap::Butt` or round caps lengthen every dash.
 * Label sizing is measured, not guessed: `Scene::remote_label_size` scales the

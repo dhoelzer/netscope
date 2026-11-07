@@ -26,6 +26,10 @@ pub const MIN_LABELED_SQUARE: f64 = 24.0;
 /// Radius bounds for the local-network circle.
 pub const LAN_MIN_RADIUS: f64 = 96.0;
 pub const LAN_MAX_RADIUS: f64 = 190.0;
+/// Gap the local-network circle must leave between itself and the 1-hop guide
+/// line: that gap is the lane where broadcast and multicast groups are drawn,
+/// so the circle shrinks to keep it usable rather than swallow it.
+pub const LAN_LANE_RESERVE: f64 = 120.0;
 pub const LAN_MARGIN: f64 = 28.0;
 /// Vertical room kept for the LAN caption between panel and circle.
 pub const LAN_TITLE_RESERVE: f64 = 34.0;
@@ -49,7 +53,9 @@ pub const HOP_LEFT_MARGIN: f64 = 76.0;
 /// last guide line.
 pub const FAR_LEFT_MARGIN: f64 = 22.0;
 /// Number of vertical hop guide lines.
-pub const HOP_LINES: usize = 15;
+pub const HOP_LINES: usize = 20;
+/// Room kept between a near-lane label and the shapes that bound the lane.
+pub const NEAR_LANE_LABEL_PAD: f64 = 12.0;
 /// The rightmost guide line sits this fraction of the window width in from the
 /// right edge; the rest are spaced evenly leftward from it.
 pub const HOP_RIGHT_FRACTION: f64 = 0.25;
@@ -101,13 +107,28 @@ pub struct PlacedLan {
     pub hidden: usize,
 }
 
+/// Which band of the display a remote circle was put in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteBand {
+    /// A hop guide line; index 0 is the 1-hop line.
+    Hop(usize),
+    /// Broadcast or multicast group, parked beside the local network.
+    Near,
+    /// Distance unknown, or further than the last guide line.
+    Far,
+}
+
 #[derive(Debug, Clone)]
 pub struct PlacedRemote {
     pub center: Point,
     pub radius: f64,
     pub host: RemoteHost,
-    /// Guide line this host sits on, `None` for the left-edge bucket.
+    /// Guide line this host sits on, `None` for a band with no line.
     pub slot: Option<usize>,
+    /// Which band the circle belongs to.
+    pub band: RemoteBand,
+    /// Horizontal room this circle's label may use.
+    pub label_budget: f64,
 }
 
 /// One vertical hop guide line and the hop count it stands for.
@@ -124,6 +145,19 @@ pub fn hop_line_positions(width: f64) -> Vec<f64> {
     let left = HOP_LEFT_MARGIN.min(right);
     let pitch = (right - left) / (HOP_LINES - 1) as f64;
     (0..HOP_LINES).map(|i| right - i as f64 * pitch).collect()
+}
+
+/// X of the lane for group traffic: the midpoint of the gap between the 1-hop
+/// guide line and the local-network circle's rim. If a window is too narrow to
+/// leave a real gap, the lane stays just right of the line, which is still the
+/// local side of the ruler.
+#[must_use]
+pub fn near_lane_x(line_one: f64, lan_rim: f64) -> f64 {
+    if lan_rim > line_one {
+        (line_one + lan_rim) / 2.0
+    } else {
+        line_one + 12.0
+    }
 }
 
 /// The guide line index for a hop count, or `None` when the host belongs at the
@@ -153,10 +187,11 @@ pub struct Layout {
     pub hop_lines: Vec<HopLine>,
     /// X of the left-edge bucket.
     pub far_x: f64,
+    /// X of the lane holding broadcast and multicast groups.
+    pub near_x: f64,
     /// Vertical room under a circle for its detail line, 0 when there is none.
     pub detail_budget: f64,
 }
-
 /// Places every shape for the current frame.
 ///
 /// `now` drives the slide-in animation that carries a circle from the left edge
@@ -173,13 +208,19 @@ pub fn build(
     let mut layout = Layout::default();
     let vertical_pad = 40.0;
 
+    let positions = hop_line_positions(width);
     let host = place_host(width, height, network);
-    let lan_circle = place_lan(width, height, host.rect.y1, lan);
+    // The circle is placed knowing where the 1-hop line is, so it can shrink to
+    // leave the group lane open rather than cover it.
+    let lan_circle = place_lan(width, height, host.rect.y1, lan, positions[0]);
+    let lan_rim = lan_circle.center.x - lan_circle.radius;
     layout.host = Some(host);
     layout.lan = Some(lan_circle);
 
-    let positions = hop_line_positions(width);
     layout.far_x = FAR_LEFT_MARGIN;
+    // Group traffic is parked in the region the 1-hop line and the
+    // local-network circle leave between them.
+    layout.near_x = near_lane_x(positions[0], lan_rim);
     layout.hop_lines = positions
         .iter()
         .enumerate()
@@ -190,13 +231,20 @@ pub fn build(
     // top. Hosts with no usable TTL reading share the left-edge bucket.
     let mut by_slot: Vec<Vec<&RemoteHost>> = vec![Vec::new(); HOP_LINES];
     let mut far: Vec<&RemoteHost> = Vec::new();
+    let mut near: Vec<&RemoteHost> = Vec::new();
     for host in remotes {
-        match hop_slot(host.hops) {
-            Some(i) => by_slot[i].push(host),
-            None => far.push(host),
+        // Groups bypass the hop ruler entirely: their TTL is not a distance.
+        if host.group {
+            near.push(host);
+        } else {
+            match hop_slot(host.hops) {
+                Some(i) => by_slot[i].push(host),
+                None => far.push(host),
+            }
         }
     }
     sort_fresh(&mut far);
+    sort_fresh(&mut near);
     for bucket in &mut by_slot {
         sort_fresh(bucket);
     }
@@ -209,6 +257,7 @@ pub fn build(
         .iter()
         .map(Vec::len)
         .chain(std::iter::once(far.len()))
+        .chain(std::iter::once(near.len()))
         .max()
         .unwrap_or(0);
     let band = (grid_bottom - grid_top).max(MIN_REMOTE_SLOT);
@@ -219,7 +268,7 @@ pub fn build(
     if tallest > (band / slot).floor() as usize {
         slot = (band / tallest as f64).clamp(MIN_REMOTE_SLOT, REMOTE_SLOT);
     }
-    // The guide-line pitch is tighter than the row pitch once 15 lines share
+    // The guide-line pitch is tighter than the row pitch once 20 lines share
     // the window, so it bounds the circle radius; otherwise neighbouring lines'
     // circles would touch.
     let line_pitch = positions
@@ -233,7 +282,11 @@ pub fn build(
     // line never sit on top of those shapes.
     let lan = layout.lan.clone().unwrap();
     let panel = layout.host.clone().unwrap();
-    let band_for = |x: f64| -> (f64, f64) {
+    // `below_panel` is only set for the near lane: a circle there has to clear
+    // the host panel from underneath, because the lane runs under it. Every
+    // other line stops above the panel instead.
+    let band_for = |x: f64, below_panel: bool| -> (f64, f64) {
+        let mut top = grid_top + radius;
         let mut bottom = grid_bottom;
         let dx = x - lan.center.x;
         if dx.abs() < lan.radius {
@@ -241,20 +294,34 @@ pub fn build(
             bottom = bottom.min(lan.center.y - half - radius - 6.0);
         }
         if x > panel.rect.x0 - radius {
-            bottom = bottom.min(panel.rect.y1 - radius - 6.0);
+            if below_panel {
+                top = top.max(panel.rect.y1 + radius + 6.0);
+            } else {
+                bottom = bottom.min(panel.rect.y1 - radius - 6.0);
+            }
         }
         // The colour key owns the bottom-left corner.
         if x < LEGEND_WIDTH {
             bottom = bottom.min(height - LEGEND_RESERVE);
         }
-        (grid_top + radius, (bottom - radius).max(grid_top + radius))
+        (top, (bottom - radius).max(top))
     };
 
-    let mut place = |x: f64, bucket: &Vec<&RemoteHost>, slot_index: Option<usize>| {
+    let pitch_budget = (line_pitch - 6.0).max(0.0);
+    let near_x = layout.near_x;
+    // A near-lane label is centred on the lane, so it can use the whole gap
+    // between the 1-hop line and the local-network circle.
+    let near_budget = (lan_rim - positions[0] - NEAR_LANE_LABEL_PAD).max(0.0);
+
+    let mut place = |x: f64,
+                     bucket: &Vec<&RemoteHost>,
+                     slot_index: Option<usize>,
+                     band: RemoteBand,
+                     label_budget: f64| {
         if bucket.is_empty() {
             return;
         }
-        let (top, bottom) = band_for(x);
+        let (top, bottom) = band_for(x, matches!(band, RemoteBand::Near));
         // Each line fits as many rows as its own band allows.
         let room = ((bottom - top) / slot).floor() as usize + 1;
         let shown = bucket.len().min(room.max(1));
@@ -266,21 +333,24 @@ pub fn build(
                 radius,
                 host: (*host).clone(),
                 slot: slot_index,
+                band,
+                label_budget,
             });
         }
         layout.hidden += bucket.len() - shown;
     };
 
-    place(layout.far_x, &far, None);
+    place(layout.far_x, &far, None, RemoteBand::Far, pitch_budget);
+    place(near_x, &near, None, RemoteBand::Near, near_budget);
     for (i, x) in positions.iter().enumerate() {
-        place(*x, &by_slot[i], Some(i));
+        place(*x, &by_slot[i], Some(i), RemoteBand::Hop(i), pitch_budget);
     }
 
     layout.slot = slot;
     // Labels sit centred under their circle, where they get the whole guide-line
-    // pitch to work in; beside the circle there is barely any room once 15 lines
+    // pitch to work in; beside the circle there is barely any room once 20 lines
     // share the window.
-    layout.label_budget = (line_pitch - 6.0).max(0.0);
+    layout.label_budget = pitch_budget;
     // The per-host detail line only earns space when rows are tall enough to
     // hold it under the address.
     layout.detail_budget = if slot - radius * 2.0 >= DETAIL_ROOM {
@@ -394,7 +464,17 @@ fn place_host(width: f64, height: f64, network: &LocalNetwork) -> PlacedHost {
 }
 
 /// The local-network circle: large, in the lower-right corner.
-fn place_lan(width: f64, height: f64, panel_bottom: f64, lan: &[LanHost]) -> PlacedLan {
+///
+/// `line_one` is the x of the 1-hop guide line. The circle may not grow past
+/// `line_one - LAN_LANE_RESERVE`, because the space between the two is where
+/// broadcast and multicast groups live.
+fn place_lan(
+    width: f64,
+    height: f64,
+    panel_bottom: f64,
+    lan: &[LanHost],
+    line_one: f64,
+) -> PlacedLan {
     let mut ordered: Vec<&LanHost> = lan.iter().collect();
     ordered.sort_by(|a, b| {
         b.last_seen
@@ -406,8 +486,12 @@ fn place_lan(width: f64, height: f64, panel_bottom: f64, lan: &[LanHost]) -> Pla
     // below the host panel without leaving the display.
     let vertical_room = (height - panel_bottom - LAN_TITLE_RESERVE - LAN_MARGIN) / 2.0;
     let horizontal_room = (width - LAN_MARGIN - LAN_MARGIN) / 2.0;
+    // The rim sits `width - LAN_MARGIN - 2 * radius` from the left, so halve
+    // the room to keep the group lane between rim and line open.
+    let lane_room = (width - LAN_MARGIN - LAN_LANE_RESERVE - line_one) / 2.0;
     let radius = vertical_room
         .min(horizontal_room)
+        .min(lane_room)
         .clamp(LAN_MIN_RADIUS, LAN_MAX_RADIUS)
         .min(height / 2.0)
         .min(width / 2.0);
