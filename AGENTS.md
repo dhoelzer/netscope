@@ -95,3 +95,27 @@ come from `vello_cpu::color::{AlphaColor, Srgb}`).
   instead of losing its last octet. `tests/render.rs` checks hop labels stay
   separate at several window widths, which is what caught the axis caption
   colliding with the hop numbers.
+
+## Hover tooltips
+
+* `Scene::draw` takes a `hover: Option<Point>` in **logical** window
+  coordinates (winit gives physical ones; convert with `to_logical`). The tooltip
+  is drawn last so it sits above the shape it names.
+* `layout::hit_test` resolves the pointer to a `Hit`. Order matters and is
+  deliberate: remotes, then LAN peer dots, then interface squares, then the host
+  panel, then the LAN circle, then lines. Whatever is painted on top wins, so a
+  peer dot inside the LAN circle reads as the peer.
+* Lines are matched by distance to the segment, not by bounding box — a thin
+  diagonal line's bbox is mostly empty space. `LINK_HIT_TOLERANCE` is the band;
+  it widens by the line's own stroke width.
+* Hit-testing uses `Layout::links`, filled **during** drawing by `stroke_fan`.
+  That is why `draw_links` takes `&mut Layout`: a tooltip can only describe a
+  line that was actually drawn this frame.
+* `examples/dump.rs --hover TARGET` renders a card into a PNG for visual checks.
+  Compare against a no-hover render of the same fixture to confirm a card appears.
+
+## Scope
+
+* Do not remove features from the working tree because they look unrelated to the
+  task at hand. Hover tooltips were stripped as "scope creep" and had to be
+  rebuilt; ask before deleting work you did not write.

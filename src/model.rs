@@ -443,4 +443,30 @@ impl Model {
     pub fn remote(&self, addr: IpAddr) -> Option<&RemoteHost> {
         self.remotes.get(&addr)
     }
+
+    /// A peer drawn as a dot inside the local-network circle.
+    #[must_use]
+    pub fn lan_peer(&self, addr: IpAddr) -> Option<&LanHost> {
+        self.lan.get(&addr)
+    }
+
+    /// One observed connection, named the way a drawn line names it.
+    #[must_use]
+    pub fn flow(&self, remote: IpAddr, local: Option<IpAddr>, service: Service) -> Option<&Flow> {
+        self.flows.get(&(remote, local, service))
+    }
+
+    #[must_use]
+    pub fn lan_link(&self, peer: IpAddr, local: IpAddr, service: Service) -> Option<&LanLink> {
+        self.lan_links.get(&(peer, local, service))
+    }
+
+    /// Connections currently drawn from one of our interfaces.
+    #[must_use]
+    pub fn flows_on_interface(&self, addr: IpAddr) -> usize {
+        self.flows
+            .values()
+            .filter(|flow| flow.local == Some(addr))
+            .count()
+    }
 }

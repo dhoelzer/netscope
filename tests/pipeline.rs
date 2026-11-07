@@ -163,7 +163,7 @@ fn fixture_replay_renders_without_panicking() {
         fps: 30.0,
         notice: Some("replay finished"),
     };
-    let placed = scene.draw(&network, &model, &hud, Instant::now());
+    let placed = scene.draw(&network, &model, &hud, Instant::now(), None);
 
     // Every remote in the model should have been placed.
     assert_eq!(placed.remotes.len(), model.remote_count());

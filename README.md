@@ -73,6 +73,13 @@ however their TTL reads.
   drawn and is gone after 45 s. Any further packet on that connection snaps it
   back to full brightness. Lines therefore disappear well before the circles
   they attach to.
+* **Hover detail** — pointing at any shape brings up a card naming it: a remote
+  circle shows its address, inferred distance (or that it is a group), packet
+  and byte totals and how long since its last packet; an interface square shows
+  the address, its kind and how many connections use it; a line shows the
+  service and the traffic in each direction; the host panel and the
+  local-network circle list what they stand for. The card is pushed clear of the
+  shape and of the window edges, so it never hides the thing being inspected.
 
 When there are more remote hosts than fit in one column, the grid wraps into
 extra columns and tightens its spacing; anything that still cannot be drawn is
@@ -241,7 +248,7 @@ encoder would produce, and is git-ignored rather than committed.
 ## Tests
 
 ```sh
-cargo test          # 88 tests: parsing, classification, TTL/hop inference, fade timing, colours, layout, render, end-to-end replay
+cargo test          # 98 tests: parsing, classification, TTL/hop inference, fade timing, colours, layout, hit-testing, render, end-to-end replay
 cargo clippy --all-targets
 ```
 

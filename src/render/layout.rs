@@ -12,6 +12,7 @@ use vello_cpu::kurbo::{Point, Rect};
 
 use crate::model::{LanHost, RemoteHost};
 use crate::net::{AddressKind, LocalAddress, LocalNetwork};
+use crate::service::Service;
 
 pub const HOST_TOP_MARGIN: f64 = 56.0;
 pub const HOST_RIGHT_MARGIN: f64 = 28.0;
@@ -69,6 +70,9 @@ pub const LEGEND_RESERVE: f64 = 150.0;
 pub const LEGEND_WIDTH: f64 = 210.0;
 /// Vertical room kept at the top of the display for the HUD text.
 pub const HUD_RESERVE: f64 = 96.0;
+/// How far from a traffic line the pointer still counts as being on it. Lines
+/// are thin and diagonal, so hit-testing them needs a band rather than a box.
+pub const LINK_HIT_TOLERANCE: f64 = 6.0;
 
 #[derive(Debug, Clone)]
 pub struct PlacedInterface {
@@ -191,6 +195,40 @@ pub struct Layout {
     pub near_x: f64,
     /// Vertical room under a circle for its detail line, 0 when there is none.
     pub detail_budget: f64,
+    /// Traffic lines actually drawn, after fanning. Rendering and hit-testing
+    /// read the same geometry, so a tooltip can only describe a line that is
+    /// really on screen.
+    pub links: Vec<DrawnLink>,
+}
+
+/// One drawn traffic line, after fanning, plus the connection it stands for.
+#[derive(Debug, Clone)]
+pub struct DrawnLink {
+    pub a: Point,
+    pub b: Point,
+    pub service: Service,
+    pub opacity: f32,
+    pub width: f64,
+    pub key: LinkKey,
+}
+
+/// Names the connection a drawn line represents, so a hit on a line can be
+/// looked back up in the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LinkKey {
+    Flow(IpAddr, Option<IpAddr>, Service),
+    LanLink(IpAddr, IpAddr, Service),
+}
+
+/// What the pointer is sitting on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Hit {
+    Remote(IpAddr),
+    LanPeer(IpAddr),
+    Interface(IpAddr),
+    HostPanel,
+    LanCircle,
+    Link(LinkKey),
 }
 /// Places every shape for the current frame.
 ///
@@ -691,4 +729,121 @@ pub fn describe_interface(addr: &LocalAddress) -> String {
         AddressKind::Global => "global",
     };
     format!("{} ({})", crate::net::format_address(addr.ip), kind)
+}
+
+/// Squared distance from `point` to the segment `a`..`b`.
+fn distance_sq_to_segment(point: Point, a: Point, b: Point) -> f64 {
+    let vx = b.x - a.x;
+    let vy = b.y - a.y;
+    let len_sq = vx * vx + vy * vy;
+    if len_sq <= f64::EPSILON {
+        return (point.x - a.x).powi(2) + (point.y - a.y).powi(2);
+    }
+    let t = ((point.x - a.x) * vx + (point.y - a.y) * vy) / len_sq;
+    let t = t.clamp(0.0, 1.0);
+    let dx = point.x - (a.x + t * vx);
+    let dy = point.y - (a.y + t * vy);
+    dx * dx + dy * dy
+}
+
+/// The shape under the pointer, or `None` in empty space.
+///
+/// Checked in reverse draw order, so whatever is painted on top wins: a peer dot
+/// inside the local-network circle reads as the peer, and a circle reads as
+/// itself rather than the line running underneath it. Lines are last, and are
+/// matched by distance rather than by a bounding box, since a thin diagonal line
+/// has a bounding box that is mostly empty space.
+#[must_use]
+pub fn hit_test(layout: &Layout, at: Point) -> Option<Hit> {
+    for remote in &layout.remotes {
+        if (at.x - remote.center.x).powi(2) + (at.y - remote.center.y).powi(2)
+            <= remote.radius.powi(2)
+        {
+            return Some(Hit::Remote(remote.host.addr));
+        }
+    }
+    if let Some(lan) = &layout.lan {
+        for peer in &lan.hosts {
+            let centre = Point {
+                x: lan.center.x + peer.offset.x,
+                y: lan.center.y + peer.offset.y,
+            };
+            if (at.x - centre.x).powi(2) + (at.y - centre.y).powi(2) <= peer.radius.powi(2) {
+                return Some(Hit::LanPeer(peer.addr));
+            }
+        }
+    }
+    if let Some(host) = &layout.host {
+        for iface in &host.interfaces {
+            if iface.rect.contains(at) {
+                return Some(Hit::Interface(iface.addr));
+            }
+        }
+    }
+    if let Some(host) = &layout.host
+        && host.rect.contains(at)
+    {
+        return Some(Hit::HostPanel);
+    }
+    if let Some(lan) = &layout.lan
+        && (at.x - lan.center.x).powi(2) + (at.y - lan.center.y).powi(2) <= lan.radius.powi(2)
+    {
+        return Some(Hit::LanCircle);
+    }
+    // Nearest line within a few pixels of it, widened by the line's own stroke
+    // so a fat, busy link is no harder to hit than a thin one.
+    let mut best: Option<(f64, LinkKey)> = None;
+    for link in &layout.links {
+        let reach = LINK_HIT_TOLERANCE + link.width / 2.0;
+        let dist = distance_sq_to_segment(at, link.a, link.b);
+        if dist <= reach * reach && best.is_none_or(|(d, _)| dist < d) {
+            best = Some((dist, link.key));
+        }
+    }
+    best.map(|(_, key)| Hit::Link(key))
+}
+
+/// Bounding box of a circle.
+fn circle_box(center: Point, radius: f64) -> Rect {
+    Rect::new(
+        center.x - radius,
+        center.y - radius,
+        center.x + radius,
+        center.y + radius,
+    )
+}
+
+/// The box a tooltip should be placed beside, so it points at what it describes.
+#[must_use]
+pub fn hit_anchor(layout: &Layout, hit: &Hit) -> Option<Rect> {
+    match hit {
+        Hit::Remote(addr) => layout
+            .remotes
+            .iter()
+            .find(|r| r.host.addr == *addr)
+            .map(|r| circle_box(r.center, r.radius)),
+        Hit::LanPeer(addr) => layout.lan.as_ref().and_then(|lan| {
+            lan.hosts.iter().find(|p| p.addr == *addr).map(|p| {
+                circle_box(
+                    Point::new(lan.center.x + p.offset.x, lan.center.y + p.offset.y),
+                    p.radius,
+                )
+            })
+        }),
+        Hit::Interface(addr) => layout
+            .host
+            .as_ref()
+            .and_then(|h| h.interfaces.iter().find(|i| i.addr == *addr))
+            .map(|i| i.rect),
+        Hit::HostPanel => layout.host.as_ref().map(|h| h.rect),
+        Hit::LanCircle => layout.lan.as_ref().map(|l| circle_box(l.center, l.radius)),
+        Hit::Link(key) => layout.links.iter().find(|l| l.key == *key).map(|l| {
+            Rect::new(
+                l.a.x.min(l.b.x),
+                l.a.y.min(l.b.y),
+                l.a.x.max(l.b.x),
+                l.a.y.max(l.b.y),
+            )
+        }),
+    }
 }

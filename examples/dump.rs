@@ -10,6 +10,7 @@ use netscope::net::LocalNetwork;
 use netscope::render::{Hud, Scene};
 use pcap::Capture;
 use std::time::Instant;
+use vello_cpu::kurbo::Point;
 
 const DEFAULT_WIDTH: u16 = 1920;
 const DEFAULT_HEIGHT: u16 = 800;
@@ -18,9 +19,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let out = args
         .next()
-        .ok_or("usage: dump OUT.png IN.pcap [--local SPECS..] [--size W H]")?;
+        .ok_or("usage: dump OUT.png IN.pcap [--local SPECS..] [--size W H] [--hover TARGET]")?;
     let input = args.next().ok_or("missing pcap path")?;
     let mut local = Vec::new();
+    let mut hover_target = None;
     let mut width = DEFAULT_WIDTH;
     let mut height = DEFAULT_HEIGHT;
     let mut rest: Vec<String> = args.collect();
@@ -28,6 +30,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rest.remove(index);
         while rest.first().is_some_and(|v| !v.starts_with("--")) {
             local.push(rest.remove(0));
+        }
+    }
+    // --hover names a shape that exists in this frame (an address, `lan` or
+    // `host`), so the tooltip can be checked against something real.
+    if let Some(index) = rest.iter().position(|v| v == "--hover") {
+        rest.remove(index);
+        if !rest.is_empty() {
+            hover_target = Some(rest.remove(0));
         }
     }
     if let Some(index) = rest.iter().position(|v| v == "--size") {
@@ -68,7 +78,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Replay stamps every packet at t0, so drawing at t0 would freeze the
     // slide-in at its start. Advance past it to show the settled view.
     let settled = t0 + std::time::Duration::from_secs(2);
-    scene.draw(&network, &model, &hud, settled);
+    let placed = scene.draw(&network, &model, &hud, settled, None);
+    let hover = hover_target.as_deref().and_then(|target| match target {
+        "lan" => placed.lan.map(|l| Point {
+            x: l.center.x,
+            y: l.center.y,
+        }),
+        "host" => placed.host.map(|h| Point {
+            x: h.rect.x0 + 4.0,
+            y: h.rect.y0 + 4.0,
+        }),
+        addr => {
+            let Ok(addr) = addr.parse::<std::net::IpAddr>() else {
+                return None;
+            };
+            if let Some(r) = placed.remotes.iter().find(|r| r.host.addr == addr) {
+                return Some(Point {
+                    x: r.center.x,
+                    y: r.center.y,
+                });
+            }
+            // A LAN peer is a dot inside the local-network circle.
+            placed.lan.as_ref().and_then(|lan| {
+                lan.hosts.iter().find(|p| p.addr == addr).map(|p| Point {
+                    x: lan.center.x + p.offset.x,
+                    y: lan.center.y + p.offset.y,
+                })
+            })
+        }
+    });
+    // Draw again with the pointer in place so the tooltip lands in the image.
+    scene.draw(&network, &model, &hud, settled, hover);
 
     let rgba: Vec<u8> = scene
         .pixmap()

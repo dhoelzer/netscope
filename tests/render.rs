@@ -452,7 +452,7 @@ fn line_signal(model: &Model, at: Instant, service: Service) -> (f64, usize) {
         fps: 0.0,
         notice: None,
     };
-    scene.draw(&network(), model, &hud, at);
+    scene.draw(&network(), model, &hud, at, None);
 
     let bg = (0.047f64, 0.063, 0.094);
     let [tr, tg, tb] = service.rgb();
@@ -652,7 +652,7 @@ fn each_service_is_rendered_in_its_own_colour() {
 fn rendering_produces_a_non_blank_frame_with_the_expected_background() {
     let mut scene = Scene::new(640, 480);
     let model = Model::default();
-    let placed = scene.draw(&network(), &model, &empty_hud(), Instant::now());
+    let placed = scene.draw(&network(), &model, &empty_hud(), Instant::now(), None);
 
     let data = scene.pixmap().data();
     assert_eq!(data.len(), 640 * 480);
@@ -688,7 +688,7 @@ fn rendering_a_full_scene_draws_panel_lan_and_remotes() {
     }
 
     let mut scene = Scene::new(1280, 800);
-    let placed = scene.draw(&net, &model, &empty_hud(), now);
+    let placed = scene.draw(&net, &model, &empty_hud(), now, None);
     assert_eq!(placed.remotes.len(), 2);
     assert!(!placed.lan.as_ref().unwrap().hosts.is_empty());
     assert_eq!(placed.host.as_ref().unwrap().interfaces.len(), 3);
@@ -699,7 +699,13 @@ fn rendering_a_full_scene_draws_panel_lan_and_remotes() {
 fn rendering_survives_a_resize_and_an_empty_model() {
     let mut scene = Scene::new(1280, 800);
     scene.resize(320, 240);
-    let placed = scene.draw(&network(), &Model::default(), &empty_hud(), Instant::now());
+    let placed = scene.draw(
+        &network(),
+        &Model::default(),
+        &empty_hud(),
+        Instant::now(),
+        None,
+    );
     assert!(placed.host.is_some());
     assert!(placed.lan.is_some());
     assert_eq!(scene.pixmap().data().len(), 320 * 240);
@@ -724,7 +730,7 @@ fn off_background(px: &(u8, u8, u8)) -> bool {
 fn all_twenty_guide_lines_are_drawn_where_the_layout_says() {
     let now = Instant::now();
     let mut scene = Scene::new(1280, 800);
-    scene.draw(&network(), &Model::default(), &empty_hud(), now);
+    scene.draw(&network(), &Model::default(), &empty_hud(), now, None);
 
     let data = scene.pixmap().data();
     let width = 1280usize;
@@ -771,7 +777,7 @@ fn all_twenty_guide_lines_are_drawn_where_the_layout_says() {
 fn guide_lines_are_dashed_not_solid() {
     let now = Instant::now();
     let mut scene = Scene::new(1280, 800);
-    scene.draw(&network(), &Model::default(), &empty_hud(), now);
+    scene.draw(&network(), &Model::default(), &empty_hud(), now, None);
 
     let data = scene.pixmap().data();
     let width = 1280usize;
@@ -809,7 +815,7 @@ fn a_remote_is_drawn_on_the_line_its_ttl_implied() {
     model.ingest(&Sample { frame }, &net, now);
 
     let mut scene = Scene::new(1280, 800);
-    let placed = scene.draw(&net, &model, &empty_hud(), now);
+    let placed = scene.draw(&net, &model, &empty_hud(), now, None);
     assert_eq!(placed.remotes.len(), 1);
     let remote = &placed.remotes[0];
     assert_eq!(remote.host.hops, Some(6));
@@ -854,7 +860,7 @@ fn a_host_with_no_ttl_reading_is_parked_at_the_left_edge() {
     model.ingest(&Sample { frame }, &net, now);
 
     let mut scene = Scene::new(1280, 800);
-    let placed = scene.draw(&net, &model, &empty_hud(), now);
+    let placed = scene.draw(&net, &model, &empty_hud(), now, None);
     let remote = &placed.remotes[0];
     assert_eq!(remote.host.hops, None);
     assert_eq!(remote.slot, None);
@@ -930,7 +936,13 @@ fn hop_labels_stay_separate_at_every_window_width() {
     // together; each must still occupy its own run of pixels.
     for width in [1280usize, 900, 620] {
         let mut scene = Scene::new(width as u16, 800);
-        scene.draw(&network(), &Model::default(), &empty_hud(), Instant::now());
+        scene.draw(
+            &network(),
+            &Model::default(),
+            &empty_hud(),
+            Instant::now(),
+            None,
+        );
 
         let data = scene.pixmap().data();
         let positions = layout::hop_line_positions(width as f64);
@@ -1031,4 +1043,255 @@ fn the_lan_circle_shrinks_to_keep_the_near_lane_open() {
         "the lane centre {} should sit between {line_one} and {rim}",
         placed.near_x
     );
+}
+
+// ---- hover / tooltips ----------------------------------------------------
+
+/// A scene with one remote, one LAN peer and traffic in both directions.
+fn pkt(src: &str, dst: &str, port: u16) -> Sample {
+    Sample {
+        frame: Frame {
+            src: ip(src),
+            dst: ip(dst),
+            src_port: Some(51_000),
+            dst_port: Some(port),
+            transport: if port == 53 {
+                Transport::Udp
+            } else {
+                Transport::Tcp
+            },
+            wire_len: 60,
+            ttl: 64,
+        },
+    }
+}
+
+fn hover_scene() -> (Model, layout::Layout) {
+    let net = network();
+    let mut model = Model::default();
+    let at = Instant::now();
+    model.ingest(&pkt("192.168.1.20", "203.0.113.9", 443), &net, at);
+    model.ingest(&pkt("203.0.113.9", "192.168.1.20", 443), &net, at);
+    model.ingest(&pkt("192.168.1.20", "192.168.1.7", 53), &net, at);
+    let placed = scene_layout(&net, &model, at);
+    (model, placed)
+}
+
+fn scene_layout(net: &LocalNetwork, model: &Model, at: Instant) -> layout::Layout {
+    let mut scene = Scene::new(1280, 800);
+    scene.draw(net, model, &empty_hud(), at, None)
+}
+
+#[test]
+fn hovering_a_remote_circle_hits_that_host() {
+    let (_model, placed) = hover_scene();
+    let remote = placed.remotes.first().expect("a remote circle");
+    let hit = layout::hit_test(&placed, remote.center);
+    assert_eq!(hit, Some(layout::Hit::Remote(remote.host.addr)));
+}
+
+#[test]
+fn empty_space_gets_no_tooltip() {
+    let (_model, placed) = hover_scene();
+    // Far from every shape: the gap between the host panel and the LAN circle
+    // is not a line here, and well clear of the remote.
+    let hit = layout::hit_test(&placed, Point { x: 700.0, y: 780.0 });
+    assert_eq!(hit, None);
+}
+
+#[test]
+fn hovering_a_traffic_line_hits_the_connection_it_drew() {
+    let (_model, placed) = hover_scene();
+    let link = placed
+        .links
+        .iter()
+        .find(|l| matches!(l.key, layout::LinkKey::Flow(..)))
+        .expect("a flow line should be recorded");
+    // The midpoint of the drawn segment is on the line by definition.
+    let mid = Point {
+        x: (link.a.x + link.b.x) / 2.0,
+        y: (link.a.y + link.b.y) / 2.0,
+    };
+    let hit = layout::hit_test(&placed, mid);
+    assert_eq!(hit, Some(layout::Hit::Link(link.key)));
+}
+
+#[test]
+fn a_line_is_hit_a_few_pixels_off_but_not_far_off() {
+    let (_model, placed) = hover_scene();
+    let link = placed
+        .links
+        .iter()
+        .find(|l| matches!(l.key, layout::LinkKey::Flow(..)))
+        .expect("a flow line should be recorded");
+    let mid = Point {
+        x: (link.a.x + link.b.x) / 2.0,
+        y: (link.a.y + link.b.y) / 2.0,
+    };
+    // Just inside the tolerance band: still the line.
+    let near = layout::hit_test(
+        &placed,
+        Point {
+            x: mid.x,
+            y: mid.y + layout::LINK_HIT_TOLERANCE - 1.0,
+        },
+    );
+    assert!(matches!(near, Some(layout::Hit::Link(_))), "got {near:?}");
+    // Well outside it: no tooltip, rather than a wrong one.
+    let far = layout::hit_test(
+        &placed,
+        Point {
+            x: mid.x,
+            y: mid.y + layout::LINK_HIT_TOLERANCE + 40.0,
+        },
+    );
+    assert!(!matches!(far, Some(layout::Hit::Link(_))), "got {far:?}");
+}
+
+#[test]
+fn a_circle_wins_over_a_line_running_under_it() {
+    let (_model, placed) = hover_scene();
+    let remote = placed.remotes.first().expect("a remote circle");
+    // The link to that host ends at the circle's rim, so sampling just inside
+    // the rim must name the host, not the line.
+    let inside = Point {
+        x: remote.center.x,
+        y: remote.center.y + remote.radius * 0.5,
+    };
+    assert_eq!(
+        layout::hit_test(&placed, inside),
+        Some(layout::Hit::Remote(remote.host.addr))
+    );
+}
+
+#[test]
+fn hovering_the_host_panel_names_the_host_and_its_interface_wins() {
+    let (_model, placed) = hover_scene();
+    let host = placed.host.as_ref().expect("host panel");
+    let iface = host.interfaces.first().expect("an interface square");
+    assert_eq!(
+        layout::hit_test(
+            &placed,
+            Point {
+                x: iface.rect.x0 + 2.0,
+                y: iface.rect.y0 + 2.0
+            }
+        ),
+        Some(layout::Hit::Interface(iface.addr))
+    );
+    // A point in the panel but clear of every square is the panel itself.
+    let bare = Point {
+        x: host.rect.x1 - 3.0,
+        y: host.rect.y1 - 3.0,
+    };
+    assert_eq!(
+        layout::hit_test(&placed, bare),
+        Some(layout::Hit::HostPanel)
+    );
+}
+
+#[test]
+fn a_lan_peer_dot_wins_over_the_circle_containing_it() {
+    let (_model, placed) = hover_scene();
+    let lan = placed.lan.as_ref().expect("lan circle");
+    let peer = lan.hosts.first().expect("a peer dot");
+    let at = Point {
+        x: lan.center.x + peer.offset.x,
+        y: lan.center.y + peer.offset.y,
+    };
+    assert_eq!(
+        layout::hit_test(&placed, at),
+        Some(layout::Hit::LanPeer(peer.addr))
+    );
+    // Away from any dot but still inside the circle: the circle itself.
+    let ring = Point {
+        x: lan.center.x,
+        y: lan.center.y - lan.radius * 0.85,
+    };
+    assert_eq!(
+        layout::hit_test(&placed, ring),
+        Some(layout::Hit::LanCircle)
+    );
+}
+
+#[test]
+fn every_hit_kind_has_an_anchor_for_the_card_to_sit_beside() {
+    let (_model, placed) = hover_scene();
+    let hits = [
+        layout::Hit::Remote(ip("203.0.113.9")),
+        layout::Hit::LanPeer(ip("192.168.1.7")),
+        layout::Hit::Interface(ip("192.168.1.20")),
+        layout::Hit::HostPanel,
+        layout::Hit::LanCircle,
+    ];
+    for hit in hits {
+        assert!(
+            layout::hit_anchor(&placed, &hit).is_some(),
+            "{hit:?} should have an anchor"
+        );
+    }
+    let key = placed
+        .links
+        .iter()
+        .find(|l| matches!(l.key, layout::LinkKey::Flow(..)))
+        .expect("a flow line")
+        .key;
+    let anchor = layout::hit_anchor(&placed, &layout::Hit::Link(key)).expect("line anchor");
+    assert!(anchor.width() > 0.0 && anchor.height() > 0.0);
+}
+
+#[test]
+fn drawing_with_a_hover_point_renders_a_card_and_without_one_does_not() {
+    let (model, _) = hover_scene();
+    let net = network();
+    let remote_center = {
+        let placed = scene_layout(&net, &model, Instant::now());
+        placed.remotes.first().expect("a remote").center
+    };
+
+    let mut plain = Scene::new(1280, 800);
+    plain.draw(&net, &model, &empty_hud(), Instant::now(), None);
+    let mut hovered = Scene::new(1280, 800);
+    hovered.draw(
+        &net,
+        &model,
+        &empty_hud(),
+        Instant::now(),
+        Some(remote_center),
+    );
+
+    let a = plain.pixmap().data();
+    let b = hovered.pixmap().data();
+    assert_eq!(a.len(), b.len());
+    let changed = a
+        .iter()
+        .zip(b.iter())
+        .step_by(4)
+        .filter(|(x, y)| x != y)
+        .count();
+    // A tooltip card is hundreds of pixels of text and panel; a stray pixel
+    // would mean the hover path did something else entirely.
+    assert!(
+        changed > 500,
+        "hovering should draw a card, {changed} px differ"
+    );
+}
+
+#[test]
+fn a_hover_point_outside_every_shape_changes_nothing() {
+    let (model, _) = hover_scene();
+    let net = network();
+    // One timestamp for both draws: line fades depend on it, so two separate
+    // Instant::now() calls would legitimately differ in pixel values.
+    let now = Instant::now();
+    let empty = Point { x: 700.0, y: 780.0 };
+    assert_eq!(
+        layout::hit_test(&scene_layout(&net, &model, now), empty),
+        None
+    );
+    let mut plain = Scene::new(1280, 800);
+    plain.draw(&net, &model, &empty_hud(), now, None);
+    let mut hovered = Scene::new(1280, 800);
+    hovered.draw(&net, &model, &empty_hud(), now, Some(empty));
+    assert_eq!(plain.pixmap().data(), hovered.pixmap().data());
 }

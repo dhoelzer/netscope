@@ -10,7 +10,9 @@ use vello_cpu::{Pixmap, RenderContext, RenderSettings, Resources};
 use crate::capture::parse::Transport;
 use crate::model::{Model, RemoteHost};
 use crate::net::{AddressKind, LocalNetwork, format_address};
-use crate::render::layout::{DETAIL_ROOM, LAN_LABEL_PITCH, Layout, describe_interface, lan_label};
+use crate::render::layout::{
+    DETAIL_ROOM, DrawnLink, LAN_LABEL_PITCH, Layout, LinkKey, describe_interface, lan_label,
+};
 use crate::render::text::Font;
 use crate::service::Service;
 use std::collections::BTreeMap;
@@ -55,6 +57,12 @@ const HOP_LABEL_SIZE: f32 = 11.5;
 const HOP_LABEL_BASELINE: f64 = 26.0;
 /// Baseline of the HUD title, which starts below the hop labels.
 const HUD_BASELINE: f64 = 50.0;
+/// Tooltip text: deliberately larger than every label on the scene, since it is
+/// the thing the user asked to see by hovering.
+const TOOLTIP_TITLE_SIZE: f32 = 19.0;
+const TOOLTIP_SIZE: f32 = 16.5;
+const TOOLTIP_BG: Paint = rgb(0.10, 0.13, 0.19);
+const TOOLTIP_RING: Paint = rgb(0.55, 0.62, 0.74);
 
 /// Status line shown in the HUD.
 pub struct Hud<'a> {
@@ -112,29 +120,39 @@ impl Scene {
 
     /// Renders one frame and returns the layout that was drawn, so callers can
     /// log it or hit-test against it.
+    ///
+    /// `hover` is the pointer in window coordinates, or `None` when it is outside
+    /// the window. Whatever it lands on gets a tooltip.
     pub fn draw(
         &mut self,
         network: &LocalNetwork,
         model: &Model,
         hud: &Hud<'_>,
         now: std::time::Instant,
+        hover: Option<Point>,
     ) -> Layout {
         let (w, h) = (f64::from(self.width), f64::from(self.height));
         let remotes: Vec<RemoteHost> = model.remotes().cloned().collect();
         let lan: Vec<_> = model.lan().cloned().collect();
-        let placed = crate::render::layout::build(w, h, network, &remotes, &lan, now);
+        let mut placed = crate::render::layout::build(w, h, network, &remotes, &lan, now);
 
         self.ctx.reset();
         self.ctx.set_paint(BG);
         self.ctx.fill_rect(&Rect::new(0.0, 0.0, w, h));
 
         self.draw_hop_lines(&placed, h);
-        self.draw_links(&placed, model, now);
+        self.draw_links(&mut placed, model, now);
         self.draw_host(&placed);
         self.draw_lan(&placed, network);
         self.draw_remotes(&placed, now);
         self.draw_legend(model, now);
         self.draw_hud(&placed, hud);
+
+        if let Some(at) = hover
+            && let Some(target) = layout::hit_test(&placed, at)
+        {
+            self.draw_tooltip(&placed, model, network, &target, now);
+        }
 
         self.ctx.flush();
         self.ctx.render(&mut self.pixmap, &mut self.resources);
@@ -147,7 +165,9 @@ impl Scene {
     /// that share endpoints are fanned out sideways so each colour stays visible
     /// instead of being painted over by the next one.
     ///
-    fn draw_links(&mut self, placed: &Layout, model: &Model, now: std::time::Instant) {
+    /// Each line is recorded in `placed.links` as it is drawn, which is what the
+    /// pointer is matched against for link tooltips.
+    fn draw_links(&mut self, placed: &mut Layout, model: &Model, now: std::time::Instant) {
         // BTreeMap so groups draw in a stable order; within a group the lines are
         // sorted by service. An unordered fan would reshuffle and flicker on
         // every frame.
@@ -175,12 +195,17 @@ impl Scene {
                     anchor,
                     lines: Vec::new(),
                 });
-            group.lines.push((flow.service, flow.packets, opacity));
+            group.lines.push((
+                flow.service,
+                flow.packets,
+                opacity,
+                LinkKey::Flow(flow.remote, flow.local, flow.service),
+            ));
         }
 
         for group in groups.values_mut() {
-            group.lines.sort_by_key(|(service, _, _)| *service);
-            self.stroke_fan(group);
+            group.lines.sort_by_key(|line| line.0);
+            self.stroke_fan(group, &mut placed.links);
         }
 
         // Traffic between this host and the local network: from the host panel to
@@ -194,39 +219,52 @@ impl Scene {
         let Some(to) = layout::lan_anchor(placed, from) else {
             return;
         };
-        let mut lines: Vec<(Service, u64, f32)> = model
+        let mut lines: Vec<(Service, u64, f32, LinkKey)> = model
             .lan_links()
             .map(|link| {
                 (
                     link.service,
                     link.packets,
                     Model::link_opacity(link.last_seen, now),
+                    LinkKey::LanLink(link.peer, link.local, link.service),
                 )
             })
-            .filter(|(_, _, opacity)| *opacity > 0.001)
+            .filter(|(_, _, opacity, _)| *opacity > 0.001)
             .collect();
-        lines.sort_by_key(|(service, _, _)| *service);
+        lines.sort_by_key(|line| line.0);
         if !lines.is_empty() {
-            self.stroke_fan(&LinkGroup {
-                start: from,
-                anchor: to,
-                lines,
-            });
+            self.stroke_fan(
+                &LinkGroup {
+                    start: from,
+                    anchor: to,
+                    lines,
+                },
+                &mut placed.links,
+            );
         }
     }
 
     /// Strokes a group of connections sharing one pair of endpoints, fanning them
     /// sideways so every service colour stays visible.
-    fn stroke_fan(&mut self, group: &LinkGroup) {
-        for (index, (service, packets, opacity)) in group.lines.iter().enumerate() {
+    fn stroke_fan(&mut self, group: &LinkGroup, drawn: &mut Vec<DrawnLink>) {
+        for (index, (service, packets, opacity, key)) in group.lines.iter().enumerate() {
             let (a, b) = fan(group.start, group.anchor, index, group.lines.len());
+            let width = link_width(*packets);
             self.ctx.set_stroke(Stroke {
-                width: link_width(*packets),
+                width,
                 ..Stroke::default()
             });
             self.ctx
                 .set_paint(with_alpha(paint(service.rgb()), opacity * 0.85));
             self.ctx.stroke_path(&line_path(a, b));
+            drawn.push(DrawnLink {
+                a,
+                b,
+                service: *service,
+                opacity: *opacity,
+                width,
+                key: *key,
+            });
         }
     }
 
@@ -519,7 +557,197 @@ impl Scene {
         (LABEL_SIZE * (label_budget / widest) as f32).max(MIN_LABEL_SIZE)
     }
 
-    // ---- service legend ----------------------------------------------------
+    // ---- tooltip ---------------------------------------------------------
+
+    /// Names whatever the pointer is on. Drawn last so it sits above every
+    /// shape, including the one it describes.
+    fn draw_tooltip(
+        &mut self,
+        placed: &Layout,
+        model: &Model,
+        network: &LocalNetwork,
+        hit: &layout::Hit,
+        now: std::time::Instant,
+    ) {
+        let (title, lines) = match hit {
+            layout::Hit::Remote(addr) => {
+                let Some(host) = model.remote(*addr) else {
+                    return;
+                };
+                remote_tooltip(host, now)
+            }
+            layout::Hit::LanPeer(addr) => {
+                let Some(peer) = model.lan_peer(*addr) else {
+                    return;
+                };
+                (
+                    format_address(*addr),
+                    vec![
+                        "on the local network".to_string(),
+                        format!("{} packets", format_count(peer.packets)),
+                        format!(
+                            "{} · {}",
+                            format_bytes(peer.bytes),
+                            age_tag(peer.last_seen, now)
+                        ),
+                    ],
+                )
+            }
+            layout::Hit::Interface(addr) => {
+                let Some(local) = network.addresses().iter().find(|a| a.ip == *addr) else {
+                    return;
+                };
+                (
+                    describe_interface(local),
+                    vec![
+                        format!("interface {}", local.iface),
+                        format!(
+                            "{} connection{} in use",
+                            model.flows_on_interface(*addr),
+                            if model.flows_on_interface(*addr) == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        ),
+                    ],
+                )
+            }
+            layout::Hit::HostPanel => (
+                "this host".to_string(),
+                vec![
+                    format!(
+                        "{} address{}",
+                        network.addresses().len(),
+                        if network.addresses().len() == 1 {
+                            ""
+                        } else {
+                            "es"
+                        }
+                    ),
+                    "the squares are its interfaces".to_string(),
+                ],
+            ),
+            layout::Hit::LanCircle => (
+                lan_label(network),
+                vec![
+                    format!(
+                        "{} peer{} seen",
+                        model.lan_count(),
+                        if model.lan_count() == 1 { "" } else { "s" }
+                    ),
+                    "hosts on our networks, not our own addresses".to_string(),
+                ],
+            ),
+            layout::Hit::Link(key) => match key {
+                layout::LinkKey::Flow(remote, local, service) => {
+                    let Some(flow) = model.flow(*remote, *local, *service) else {
+                        return;
+                    };
+                    link_tooltip(
+                        service,
+                        &Directions {
+                            to_packets: flow.to_remote_packets,
+                            to_bytes: flow.to_remote_bytes,
+                            from_packets: flow.from_remote_packets,
+                            from_bytes: flow.from_remote_bytes,
+                        },
+                        &format_address(*remote),
+                        local.map(format_address),
+                        flow.last_seen,
+                        now,
+                    )
+                }
+                layout::LinkKey::LanLink(peer, local, service) => {
+                    let Some(link) = model.lan_link(*peer, *local, *service) else {
+                        return;
+                    };
+                    link_tooltip(
+                        service,
+                        &Directions {
+                            to_packets: link.to_peer_packets,
+                            to_bytes: link.to_peer_bytes,
+                            from_packets: link.from_peer_packets,
+                            from_bytes: link.from_peer_bytes,
+                        },
+                        &format_address(*peer),
+                        Some(format_address(*local)),
+                        link.last_seen,
+                        now,
+                    )
+                }
+            },
+        };
+
+        let Some(anchor) = layout::hit_anchor(placed, hit) else {
+            return;
+        };
+
+        // Size the card to its widest line, then place it beside the shape,
+        // flipping to the other side and clamping to the window so the card
+        // never hides the thing being inspected or runs off screen.
+        let pad_x = 14.0;
+        let pad_y = 12.0;
+        let gap = 14.0;
+        let title_w = f64::from(self.font.measure(&title, TOOLTIP_TITLE_SIZE));
+        let body_w = lines
+            .iter()
+            .map(|l| f64::from(self.font.measure(l, TOOLTIP_SIZE)))
+            .fold(0.0, f64::max);
+        let card_w = pad_x * 2.0 + title_w.max(body_w);
+        let line_h = f64::from(self.font.line_height(TOOLTIP_SIZE));
+        let card_h = pad_y * 2.0
+            + f64::from(self.font.line_height(TOOLTIP_TITLE_SIZE))
+            + line_h * lines.len() as f64;
+
+        let (w, h) = (f64::from(self.width), f64::from(self.height));
+        let mut x = anchor.x1 + gap;
+        if x + card_w > w - 8.0 {
+            x = anchor.x0 - gap - card_w;
+        }
+        x = x.clamp(8.0, (w - card_w - 8.0).max(8.0));
+        let mut y = (anchor.y0 + anchor.y1) / 2.0 - card_h / 2.0;
+        y = y.clamp(8.0, (h - card_h - 8.0).max(8.0));
+
+        let card = Rect::new(x, y, x + card_w, y + card_h);
+        self.ctx.set_paint(with_alpha(TOOLTIP_BG, 0.96));
+        self.ctx.fill_path(&rounded_rect(card, 9.0));
+        self.ctx.set_stroke(Stroke {
+            width: 1.4,
+            ..Stroke::default()
+        });
+        self.ctx.set_paint(TOOLTIP_RING);
+        self.ctx.stroke_path(&rounded_rect(card, 9.0));
+
+        let mut baseline = y + pad_y + f64::from(self.font.ascent(TOOLTIP_TITLE_SIZE));
+        self.font.draw(
+            &mut self.ctx,
+            &mut self.resources,
+            Point {
+                x: x + pad_x,
+                y: baseline,
+            },
+            &title,
+            TOOLTIP_TITLE_SIZE,
+        );
+        baseline += f64::from(self.font.line_height(TOOLTIP_TITLE_SIZE));
+        for line in &lines {
+            self.ctx.set_paint(DIM);
+            self.font.draw(
+                &mut self.ctx,
+                &mut self.resources,
+                Point {
+                    x: x + pad_x,
+                    y: baseline,
+                },
+                line,
+                TOOLTIP_SIZE,
+            );
+            baseline += line_h;
+        }
+    }
+
+    // ---- service legend --------------------------------------------------
 
     /// Colour key for the services currently drawn, so line colours are readable.
     fn draw_legend(&mut self, model: &Model, now: std::time::Instant) {
@@ -671,7 +899,7 @@ fn link_width(packets: u64) -> f64 {
 struct LinkGroup {
     start: Point,
     anchor: Point,
-    lines: Vec<(Service, u64, f32)>,
+    lines: Vec<(Service, u64, f32, LinkKey)>,
 }
 
 /// Offset for the `index`-th of `count` lines sharing one pair of endpoints,
@@ -743,4 +971,113 @@ fn transport_tag(transport: Transport) -> &'static str {
         Transport::Other(_) => "ip",
         Transport::None => "ip",
     }
+}
+
+// ---- tooltip text --------------------------------------------------------
+
+/// Title and body lines for a remote circle.
+fn remote_tooltip(host: &RemoteHost, now: std::time::Instant) -> (String, Vec<String>) {
+    let distance = match (host.group, host.hops) {
+        (true, _) => "broadcast / multicast group".to_string(),
+        (false, Some(hops)) => format!("{hops} hop{}", if hops == 1 { "" } else { "s" }),
+        (false, None) => "distance unknown".to_string(),
+    };
+    (
+        format_address(host.addr),
+        vec![
+            distance,
+            format!(
+                "{} packets · {}",
+                format_count(host.packets),
+                format_bytes(host.bytes)
+            ),
+            format!(
+                "{} · {} via LAN",
+                Service::new(host.last_transport, None).label(),
+                format_count(host.lan_packets)
+            ),
+            format!("last packet {}", age_tag(host.last_seen, now)),
+        ],
+    )
+}
+
+/// Title and body lines for a traffic line, with the two directions counted
+/// separately so a one-sided connection is obvious.
+/// Traffic on one connection, counted per direction.
+struct Directions {
+    to_packets: u64,
+    to_bytes: u64,
+    from_packets: u64,
+    from_bytes: u64,
+}
+
+fn link_tooltip(
+    service: &Service,
+    counts: &Directions,
+    far: &str,
+    near: Option<String>,
+    last_seen: std::time::Instant,
+    now: std::time::Instant,
+) -> (String, Vec<String>) {
+    let near = near.unwrap_or_else(|| "local network".to_string());
+    (
+        service.described(),
+        vec![
+            format!("{near} <-> {far}"),
+            format!(
+                "out {} pkts / {} - in {} pkts / {}",
+                format_count(counts.to_packets),
+                format_bytes(counts.to_bytes),
+                format_count(counts.from_packets),
+                format_bytes(counts.from_bytes)
+            ),
+            format!("last packet {}", age_tag(last_seen, now)),
+        ],
+    )
+}
+
+/// "3.4s ago" style age, coarse enough to read at a glance.
+fn age_tag(then: std::time::Instant, now: std::time::Instant) -> String {
+    let secs = now.duration_since(then).as_secs_f64();
+    if secs < 1.0 {
+        "just now".to_string()
+    } else if secs < 60.0 {
+        format!("{secs:.0}s ago")
+    } else {
+        format!("{:.0}min ago", secs / 60.0)
+    }
+}
+
+/// Bytes with a binary suffix, so a busy link does not print a 9-digit number.
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Thousands-separated count, which keeps a busy host's packet total readable.
+fn format_count(count: u64) -> String {
+    let digits = count.to_string();
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push('_');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// A rectangle with rounded corners, as a path.
+fn rounded_rect(rect: Rect, radius: f64) -> vello_cpu::kurbo::BezPath {
+    vello_cpu::kurbo::RoundedRect::new(rect.x0, rect.y0, rect.x1, rect.y1, radius).to_path(0.1)
 }

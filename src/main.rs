@@ -11,8 +11,9 @@ use netscope::capture::{CaptureEvent, CaptureHandle, CaptureStats, Source};
 use netscope::model::Model;
 use netscope::net::LocalNetwork;
 use netscope::render::{Hud, Scene};
+use vello_cpu::kurbo::Point;
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
+use winit::dpi::{LogicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
@@ -70,6 +71,7 @@ fn main() -> Result<(), netscope::Error> {
         source_label: config.source_label(),
         last_frame: None,
         fps: 0.0,
+        hover: None,
     };
 
     event_loop
@@ -254,6 +256,8 @@ struct App {
     source_label: String,
     last_frame: Option<Instant>,
     fps: f64,
+    /// Pointer position in window coordinates, `None` once it leaves the window.
+    hover: Option<Point>,
 }
 
 impl App {
@@ -327,6 +331,17 @@ impl ApplicationHandler for App {
                     window.request_redraw();
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                // Logical coordinates match the layout's, which are in window
+                // points rather than device pixels.
+                let LogicalPosition { x, y } = position.to_logical(window.scale_factor());
+                self.hover = Some(Point { x, y });
+                window.request_redraw();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.hover = None;
+                window.request_redraw();
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -366,7 +381,8 @@ impl ApplicationHandler for App {
                     fps: self.fps,
                     notice: self.notice.as_deref(),
                 };
-                self.scene.draw(&self.network, &self.model, &hud, now);
+                self.scene
+                    .draw(&self.network, &self.model, &hud, now, self.hover);
                 self.present();
                 window.set_title(&format!(
                     "netscope — {} remote hosts",
