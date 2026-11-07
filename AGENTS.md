@@ -113,6 +113,14 @@ come from `vello_cpu::color::{AlphaColor, Srgb}`).
   line that was actually drawn this frame.
 * `examples/dump.rs --hover TARGET` renders a card into a PNG for visual checks.
   Compare against a no-hover render of the same fixture to confirm a card appears.
+* **One coordinate space: device pixels.** `Scene` is sized from
+  `WindowEvent::Resized`, which reports a `PhysicalSize`, so every shape the
+  layout places is in device pixels. `CursorMoved.position` is already in device
+  pixels, so it must be passed to `Scene::draw` unconverted. Calling
+  `to_logical()` halves the coordinates on a 2x display (every Mac), the hover
+  point lands in the wrong place, and tooltips appear to do nothing. The
+  `dump` example never hit this because it feeds layout coordinates directly.
+  Pinned by `the_hover_point_is_in_the_same_device_pixels_as_the_layout`.
 
 ## Scope
 

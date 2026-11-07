@@ -13,7 +13,7 @@ use netscope::net::LocalNetwork;
 use netscope::render::{Hud, Scene};
 use vello_cpu::kurbo::Point;
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalPosition, PhysicalSize};
+use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
@@ -332,10 +332,15 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                // Logical coordinates match the layout's, which are in window
-                // points rather than device pixels.
-                let LogicalPosition { x, y } = position.to_logical(window.scale_factor());
-                self.hover = Some(Point { x, y });
+                // Keep the pointer in device pixels: the scene is sized from
+                // WindowEvent::Resized, which reports a PhysicalSize, so the
+                // layout it builds is in device pixels too. Converting to
+                // logical points would put the cursor at the wrong place on a
+                // scaled display and no shape would ever be hit.
+                self.hover = Some(Point {
+                    x: position.x,
+                    y: position.y,
+                });
                 window.request_redraw();
             }
             WindowEvent::CursorLeft { .. } => {

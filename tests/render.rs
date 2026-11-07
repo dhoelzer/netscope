@@ -1295,3 +1295,37 @@ fn a_hover_point_outside_every_shape_changes_nothing() {
     hovered.draw(&net, &model, &empty_hud(), now, Some(empty));
     assert_eq!(plain.pixmap().data(), hovered.pixmap().data());
 }
+
+// ---- coordinate space of the hover point ---------------------------------
+
+#[test]
+fn the_hover_point_is_in_the_same_device_pixels_as_the_layout() {
+    // The app sizes the scene from WindowEvent::Resized, which reports a
+    // PhysicalSize, so every shape the layout places is in device pixels. The
+    // pointer must therefore be passed through unconverted: on a 2x display a
+    // logical-point cursor lands at half the coordinates and misses every
+    // shape, which is the bug this test pins down.
+    let now = Instant::now();
+    let mut model = Model::default();
+    model.ingest(&pkt("192.168.1.20", "203.0.113.9", 443), &network(), now);
+
+    // A 1920x800-point window on a 2x display: 3840x1600 device pixels.
+    let mut scene = Scene::new(3840, 1600);
+    let placed = scene.draw(&network(), &model, &empty_hud(), now, None);
+    let remote = placed.remotes.first().expect("a remote circle");
+
+    // The pointer sits exactly on the circle, in device pixels.
+    let hit = layout::hit_test(&placed, remote.center);
+    assert_eq!(hit, Some(layout::Hit::Remote(remote.host.addr)));
+
+    // Halving it, as converting to logical points would, finds nothing.
+    let halved = Point {
+        x: remote.center.x / 2.0,
+        y: remote.center.y / 2.0,
+    };
+    assert_eq!(
+        layout::hit_test(&placed, halved),
+        None,
+        "a logical-point cursor must not be expected to hit anything"
+    );
+}
